@@ -1,5 +1,19 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
-import { Plus, X, ChevronLeft, ChevronRight, Trash2, Settings2, AlertTriangle, Users, MapPin } from "lucide-react";
+import {
+  Plus,
+  X,
+  ChevronLeft,
+  ChevronRight,
+  Trash2,
+  Settings2,
+  AlertTriangle,
+  Users,
+  MapPin,
+  Download,
+  CalendarRange,
+  Grid3x3,
+} from "lucide-react";
+import jsPDF from "jspdf";
 import { supabase, supabaseConfigured } from "./supabaseClient";
 
 // ---------- constants ----------
@@ -65,6 +79,84 @@ function overlaps(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
 }
 
+// ---------- month PDF export ----------
+
+function buildMonthPdf(monthValue, clubName, pitches, bookings) {
+  const [yearStr, monthStr] = monthValue.split("-");
+  const year = Number(yearStr);
+  const monthIndex = Number(monthStr) - 1;
+
+  const monthBookings = bookings
+    .filter((b) => {
+      const d = new Date(b.date + "T00:00:00");
+      return d.getFullYear() === year && d.getMonth() === monthIndex;
+    })
+    .sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start));
+
+  const pitchName = (id) => pitches.find((p) => p.id === id)?.name || "Pitch";
+  const monthLabel = new Date(year, monthIndex, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const marginX = 44;
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const pageWidth = doc.internal.pageSize.getWidth();
+  let y = 54;
+
+  function ensureRoom(next) {
+    if (y + next > pageHeight - 40) {
+      doc.addPage();
+      y = 54;
+    }
+  }
+
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(16);
+  doc.text(clubName, marginX, y);
+  y += 20;
+  doc.setFontSize(12);
+  doc.setFont("helvetica", "normal");
+  doc.text(`Pitch bookings — ${monthLabel}`, marginX, y);
+  y += 10;
+  doc.setDrawColor(200, 16, 46);
+  doc.setLineWidth(1.2);
+  doc.line(marginX, y, pageWidth - marginX, y);
+  y += 22;
+
+  if (!monthBookings.length) {
+    doc.setFont("helvetica", "italic");
+    doc.setFontSize(11);
+    doc.text("No bookings recorded for this month.", marginX, y);
+  } else {
+    let currentDate = null;
+    for (const b of monthBookings) {
+      if (b.date !== currentDate) {
+        currentDate = b.date;
+        ensureRoom(28);
+        y += 8;
+        doc.setFont("helvetica", "bold");
+        doc.setFontSize(12);
+        const label = new Date(b.date + "T00:00:00").toLocaleDateString(undefined, {
+          weekday: "long",
+          day: "numeric",
+          month: "long",
+        });
+        doc.text(label, marginX, y);
+        y += 16;
+      }
+      ensureRoom(16);
+      doc.setFont("helvetica", "normal");
+      doc.setFontSize(10.5);
+      const time = `${minutesToLabel(timeToMinutes(b.start))}\u2013${minutesToLabel(timeToMinutes(b.end))}`;
+      doc.text(time, marginX + 10, y);
+      doc.text(pitchName(b.pitchId), marginX + 90, y);
+      doc.text(`${b.team} (${b.coach})`, marginX + 230, y);
+      y += 15;
+    }
+  }
+
+  doc.save(`pitch-bookings-${monthValue}.pdf`);
+}
+
 export default function PitchBooker() {
   const [pitches, setPitches] = useState(null);
   const [bookings, setBookings] = useState(null);
@@ -76,6 +168,8 @@ export default function PitchBooker() {
 
   const [modalOpen, setModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
+  const [pdfOpen, setPdfOpen] = useState(false);
+  const [viewMode, setViewMode] = useState("day"); // "day" | "week"
   const [detailBooking, setDetailBooking] = useState(null);
   const [now, setNow] = useState(new Date());
 
@@ -356,6 +450,9 @@ export default function PitchBooker() {
             <h1>Drogheda Town FC</h1>
             <p className="pb-sub">Pitch booking — see who's on before you turn up.</p>
           </div>
+          <button className="pb-icon-btn" onClick={() => setPdfOpen(true)} aria-label="Download month PDF">
+            <Download size={18} />
+          </button>
           <button className="pb-icon-btn" onClick={() => setManageOpen(true)} aria-label="Manage pitches">
             <Settings2 size={18} />
           </button>
@@ -372,39 +469,62 @@ export default function PitchBooker() {
         </div>
       )}
 
+      <div className="pb-view-toggle">
+        <button
+          className={`pb-toggle-btn ${viewMode === "day" ? "active" : ""}`}
+          onClick={() => setViewMode("day")}
+        >
+          <Grid3x3 size={14} /> Day &amp; pitches
+        </button>
+        <button
+          className={`pb-toggle-btn ${viewMode === "week" ? "active" : ""}`}
+          onClick={() => setViewMode("week")}
+        >
+          <CalendarRange size={14} /> Week per page
+        </button>
+      </div>
+
       <div className="pb-week-nav">
         <button className="pb-icon-btn" onClick={() => setWeekStart(addDays(weekStart, -7))} aria-label="Previous week">
           <ChevronLeft size={18} />
         </button>
-        <div className="pb-day-tabs">
-          {weekDays.map((d) => {
-            const iso = toISODate(d);
-            const active = iso === selectedDate;
-            const today = iso === toISODate(new Date());
-            return (
-              <button
-                key={iso}
-                className={`pb-day-tab ${active ? "active" : ""} ${today ? "today" : ""}`}
-                onClick={() => setSelectedDate(iso)}
-              >
-                <span className="pb-day-name">{d.toLocaleDateString(undefined, { weekday: "short" })}</span>
-                <span className="pb-day-num">{d.getDate()}</span>
-              </button>
-            );
-          })}
-        </div>
+        {viewMode === "day" ? (
+          <div className="pb-day-tabs">
+            {weekDays.map((d) => {
+              const iso = toISODate(d);
+              const active = iso === selectedDate;
+              const today = iso === toISODate(new Date());
+              return (
+                <button
+                  key={iso}
+                  className={`pb-day-tab ${active ? "active" : ""} ${today ? "today" : ""}`}
+                  onClick={() => setSelectedDate(iso)}
+                >
+                  <span className="pb-day-name">{d.toLocaleDateString(undefined, { weekday: "short" })}</span>
+                  <span className="pb-day-num">{d.getDate()}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="pb-week-range-label">
+            {fmtDayLabel(weekDays[0])} – {fmtDayLabel(weekDays[6])}
+          </div>
+        )}
         <button className="pb-icon-btn" onClick={() => setWeekStart(addDays(weekStart, 7))} aria-label="Next week">
           <ChevronRight size={18} />
         </button>
       </div>
 
-      <div className="pb-date-heading">
-        {new Date(selectedDate + "T00:00:00").toLocaleDateString(undefined, {
-          weekday: "long",
-          day: "numeric",
-          month: "long",
-        })}
-      </div>
+      {viewMode === "day" && (
+        <div className="pb-date-heading">
+          {new Date(selectedDate + "T00:00:00").toLocaleDateString(undefined, {
+            weekday: "long",
+            day: "numeric",
+            month: "long",
+          })}
+        </div>
+      )}
 
       {pitches.length === 0 ? (
         <div className="pb-empty">
@@ -414,7 +534,7 @@ export default function PitchBooker() {
             Add a pitch
           </button>
         </div>
-      ) : (
+      ) : viewMode === "day" ? (
         <ScheduleGrid
           pitches={pitches}
           dayBookings={dayBookings}
@@ -422,6 +542,8 @@ export default function PitchBooker() {
           now={now}
           onSelectBooking={setDetailBooking}
         />
+      ) : (
+        <WeekAgenda weekDays={weekDays} pitches={pitches} bookings={bookings} onSelectBooking={setDetailBooking} />
       )}
 
       <button className="pb-fab" onClick={() => setModalOpen(true)}>
@@ -449,6 +571,15 @@ export default function PitchBooker() {
 
       {manageOpen && (
         <ManagePitchesModal pitches={pitches} onClose={() => setManageOpen(false)} onSave={savePitches} />
+      )}
+
+      {pdfOpen && (
+        <MonthPdfModal
+          defaultMonth={selectedDate.slice(0, 7)}
+          pitches={pitches}
+          bookings={bookings}
+          onClose={() => setPdfOpen(false)}
+        />
       )}
     </div>
   );
@@ -523,6 +654,85 @@ function ScheduleGrid({ pitches, dayBookings, isToday, now, onSelectBooking }) {
           <span className="pb-now-dot" />
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------- Week agenda (week-per-page view) ----------
+
+function WeekAgenda({ weekDays, pitches, bookings, onSelectBooking }) {
+  return (
+    <div className="pb-week-agenda">
+      {weekDays.map((d) => {
+        const iso = toISODate(d);
+        const today = iso === toISODate(new Date());
+        const items = bookings
+          .filter((b) => b.date === iso)
+          .sort((a, b) => a.start.localeCompare(b.start));
+        return (
+          <div key={iso} className={`pb-week-day-card ${today ? "today" : ""}`}>
+            <div className="pb-week-day-head">{fmtDayLabel(d)}</div>
+            {items.length === 0 ? (
+              <div className="pb-week-day-empty">No bookings</div>
+            ) : (
+              <ul className="pb-week-day-list">
+                {items.map((b) => {
+                  const idx = pitches.findIndex((p) => p.id === b.pitchId);
+                  const color = PITCH_COLORS[(idx < 0 ? 0 : idx) % PITCH_COLORS.length];
+                  return (
+                    <li key={b.id}>
+                      <button className="pb-week-item" onClick={() => onSelectBooking(b)}>
+                        <span className="pb-week-dot" style={{ background: color }} />
+                        <span className="pb-week-time">
+                          {minutesToLabel(timeToMinutes(b.start))}–{minutesToLabel(timeToMinutes(b.end))}
+                        </span>
+                        <span className="pb-week-pitch">{pitches.find((p) => p.id === b.pitchId)?.name}</span>
+                        <span className="pb-week-team">{b.team}</span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- Month PDF modal ----------
+
+function MonthPdfModal({ defaultMonth, pitches, bookings, onClose }) {
+  const [month, setMonth] = useState(defaultMonth);
+
+  function download() {
+    buildMonthPdf(month, "Drogheda Town FC", pitches, bookings);
+  }
+
+  return (
+    <div className="pb-overlay" onClick={onClose}>
+      <div className="pb-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="pb-modal-head">
+          <h2>Download month PDF</h2>
+          <button className="pb-icon-btn" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+        <div className="pb-form">
+          <label>
+            Month
+            <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
+          </label>
+          <p className="pb-repeat-hint">
+            Creates a printable PDF listing every booking that month, grouped by date, across all pitches.
+          </p>
+          <button className="pb-btn-primary pb-submit" onClick={download}>
+            <Download size={16} style={{ marginRight: 6, verticalAlign: "-2px" }} />
+            Download PDF
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1000,6 +1210,132 @@ const css = `
   font-weight: 500;
   padding: 10px 16px 4px;
   color: var(--pitch-mid);
+}
+
+.pb-view-toggle {
+  display: flex;
+  gap: 8px;
+  padding: 14px 12px 0;
+}
+.pb-toggle-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--pitch-line);
+  background: var(--card-bg);
+  color: var(--charcoal);
+  border-radius: 999px;
+  padding: 7px 13px;
+  font-family: 'Inter', sans-serif;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pb-toggle-btn.active {
+  background: var(--pitch-dark);
+  border-color: var(--pitch-dark);
+  color: var(--chalk);
+}
+
+.pb-week-range-label {
+  flex: 1;
+  text-align: center;
+  font-family: 'Oswald', sans-serif;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--charcoal);
+}
+
+.pb-week-agenda {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 10px;
+  padding: 14px 12px 24px;
+  overflow-x: auto;
+}
+@media (max-width: 760px) {
+  .pb-week-agenda {
+    grid-template-columns: 1fr;
+  }
+}
+.pb-week-day-card {
+  background: var(--card-bg);
+  border: 1px solid var(--pitch-line);
+  border-radius: 10px;
+  padding: 10px;
+  min-width: 150px;
+}
+.pb-week-day-card.today { border-color: var(--pitch-mid); border-width: 1.5px; }
+.pb-week-day-head {
+  font-family: 'Oswald', sans-serif;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--pitch-mid);
+  border-bottom: 1px solid var(--pitch-line);
+  padding-bottom: 6px;
+  margin-bottom: 8px;
+}
+.pb-week-day-empty {
+  font-size: 12px;
+  color: #9A8E8E;
+  padding: 4px 0;
+}
+.pb-week-day-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pb-week-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-left: 3px solid transparent;
+  padding: 3px 0 3px 7px;
+  cursor: pointer;
+  font-family: 'Inter', sans-serif;
+}
+.pb-week-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 5px;
+}
+.pb-week-time {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: #7C6B6B;
+}
+.pb-week-pitch {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--charcoal);
+  display: block;
+  margin-left: 12px;
+}
+.pb-week-team {
+  font-size: 11px;
+  color: #6B5B5B;
+  display: block;
+  margin-left: 12px;
+}
+
+@media print {
+  .pb-header, .pb-view-toggle, .pb-week-nav, .pb-fab, .pb-error-banner {
+    display: none !important;
+  }
+  .pb-week-agenda {
+    grid-template-columns: repeat(7, 1fr);
+  }
 }
 
 .pb-empty {
