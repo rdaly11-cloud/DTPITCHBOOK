@@ -4,10 +4,11 @@ import { supabase, supabaseConfigured } from "./supabaseClient";
 
 // ---------- constants ----------
 
-const DAY_START = 8;   // 08:00
+const DAY_START = 17;  // 17:00 (5pm)
 const DAY_END = 22;    // 22:00
 const SLOT_MIN = 30;   // grid resolution in minutes
-const PITCH_COLORS = ["#2D6A4F", "#B5651D", "#3D5A80", "#8E5572", "#5F7A34", "#7B4B2A"];
+const PITCH_COLORS = ["#C8102E", "#1C1C1C", "#8C1D25", "#4A4A4A", "#A11D2E", "#2B2B2B"];
+const REPEAT_OPTIONS = [1, 2, 3, 4, 5, 6, 8, 10, 12];
 
 const DEFAULT_PITCHES = [
   { id: "p1", name: "Main Pitch" },
@@ -221,6 +222,12 @@ export default function PitchBooker() {
     if (!supabaseConfigured) {
       return { error: null, offline: true };
     }
+
+    const dates =
+      !editingId && form.repeatWeeks > 1
+        ? Array.from({ length: form.repeatWeeks }, (_, i) => toISODate(addDays(new Date(form.date + "T00:00:00"), i * 7)))
+        : [form.date];
+
     try {
       // Re-check against the live table right before writing, so two coaches
       // tapping "confirm" seconds apart can't both grab the same slot.
@@ -228,34 +235,66 @@ export default function PitchBooker() {
         .from("bookings")
         .select("*")
         .eq("pitch_id", form.pitchId)
-        .eq("date", form.date);
+        .in("date", dates);
       if (fetchErr) throw fetchErr;
+      const live = data.map(rowToBooking);
 
-      const liveConflict = findConflict(data.map(rowToBooking), form.pitchId, form.date, form.start, form.end, editingId);
-      if (liveConflict) {
-        return { error: liveConflict };
+      if (dates.length === 1) {
+        const liveConflict = findConflict(live, form.pitchId, form.date, form.start, form.end, editingId);
+        if (liveConflict) {
+          return { error: liveConflict };
+        }
+
+        const row = {
+          pitch_id: form.pitchId,
+          date: form.date,
+          start_time: form.start,
+          end_time: form.end,
+          coach: form.coach,
+          team: form.team,
+          notes: form.notes || "",
+        };
+
+        if (editingId) {
+          const { error: err } = await supabase.from("bookings").update(row).eq("id", editingId);
+          if (err) throw err;
+        } else {
+          const { error: err } = await supabase.from("bookings").insert({ id: genId(), ...row });
+          if (err) throw err;
+        }
+
+        setBookings(await fetchBookings());
+        return { error: null };
       }
 
-      const row = {
-        pitch_id: form.pitchId,
-        date: form.date,
-        start_time: form.start,
-        end_time: form.end,
-        coach: form.coach,
-        team: form.team,
-        notes: form.notes || "",
-      };
-
-      if (editingId) {
-        const { error: err } = await supabase.from("bookings").update(row).eq("id", editingId);
-        if (err) throw err;
-      } else {
-        const { error: err } = await supabase.from("bookings").insert({ id: genId(), ...row });
-        if (err) throw err;
+      // Recurring booking: book every week that's free, skip and report any that clash.
+      const skipped = [];
+      const toInsert = [];
+      for (const d of dates) {
+        const clash = findConflict(live, form.pitchId, d, form.start, form.end, null);
+        if (clash) {
+          skipped.push({ date: d, conflict: clash });
+        } else {
+          toInsert.push({
+            id: genId(),
+            pitch_id: form.pitchId,
+            date: d,
+            start_time: form.start,
+            end_time: form.end,
+            coach: form.coach,
+            team: form.team,
+            notes: form.notes || "",
+          });
+        }
       }
 
-      setBookings(await fetchBookings());
-      return { error: null };
+      if (toInsert.length) {
+        const { error: err } = await supabase.from("bookings").insert(toInsert);
+        if (err) throw err;
+        setBookings(await fetchBookings());
+      }
+
+      return { error: null, series: { totalWeeks: dates.length, booked: toInsert.length, skipped } };
     } catch (e) {
       console.error(e);
       setError("Couldn't save the booking. Check your connection and try again.");
@@ -314,8 +353,8 @@ export default function PitchBooker() {
             </svg>
           </div>
           <div>
-            <h1>Pitch Book</h1>
-            <p className="pb-sub">See who's on, before you turn up.</p>
+            <h1>Drogheda Town FC</h1>
+            <p className="pb-sub">Pitch booking — see who's on before you turn up.</p>
           </div>
           <button className="pb-icon-btn" onClick={() => setManageOpen(true)} aria-label="Manage pitches">
             <Settings2 size={18} />
@@ -498,7 +537,9 @@ function BookingModal({ pitches, defaultDate, onClose, onSave }) {
   const [coach, setCoach] = useState("");
   const [team, setTeam] = useState("");
   const [notes, setNotes] = useState("");
+  const [repeatWeeks, setRepeatWeeks] = useState(1);
   const [conflict, setConflict] = useState(null);
+  const [seriesResult, setSeriesResult] = useState(null);
   const [saving, setSaving] = useState(false);
 
   const invalidTime = timeToMinutes(end) <= timeToMinutes(start);
@@ -508,13 +549,25 @@ function BookingModal({ pitches, defaultDate, onClose, onSave }) {
     if (!coach.trim() || !team.trim() || invalidTime) return;
     setSaving(true);
     setConflict(null);
+    setSeriesResult(null);
     const result = await onSave(
-      { pitchId, date, start, end, coach: coach.trim(), team: team.trim(), notes: notes.trim() },
+      {
+        pitchId,
+        date,
+        start,
+        end,
+        coach: coach.trim(),
+        team: team.trim(),
+        notes: notes.trim(),
+        repeatWeeks,
+      },
       null
     );
     setSaving(false);
     if (result.error) {
       setConflict(result.error);
+    } else if (result.series) {
+      setSeriesResult(result.series);
     } else {
       onClose();
     }
@@ -529,74 +582,132 @@ function BookingModal({ pitches, defaultDate, onClose, onSave }) {
             <X size={18} />
           </button>
         </div>
-        <form onSubmit={submit} className="pb-form">
-          <label>
-            Pitch
-            <select value={pitchId} onChange={(e) => setPitchId(e.target.value)}>
-              {pitches.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Date
-            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} required />
-          </label>
-          <div className="pb-form-row">
-            <label>
-              Start
-              <input type="time" value={start} onChange={(e) => setStart(e.target.value)} required />
-            </label>
-            <label>
-              End
-              <input type="time" value={end} onChange={(e) => setEnd(e.target.value)} required />
-            </label>
-          </div>
-          {invalidTime && <div className="pb-inline-warning">End time must be after start time.</div>}
-          <label>
-            Team / session
-            <input
-              type="text"
-              placeholder="e.g. U13 Boys training"
-              value={team}
-              onChange={(e) => setTeam(e.target.value)}
-              required
-            />
-          </label>
-          <label>
-            Coach
-            <input
-              type="text"
-              placeholder="Your name"
-              value={coach}
-              onChange={(e) => setCoach(e.target.value)}
-              required
-            />
-          </label>
-          <label>
-            Notes <span className="pb-optional">(optional)</span>
-            <textarea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} />
-          </label>
 
-          {conflict && (
-            <div className="pb-conflict-box">
-              <AlertTriangle size={16} />
-              <div>
-                <strong>That pitch is already booked then.</strong>
+        {seriesResult ? (
+          <div className="pb-series-summary">
+            <p>
+              Booked <strong>{seriesResult.booked}</strong> of {seriesResult.totalWeeks} weeks on{" "}
+              {pitches.find((p) => p.id === pitchId)?.name}, {minutesToLabel(timeToMinutes(start))}–
+              {minutesToLabel(timeToMinutes(end))}.
+            </p>
+            {seriesResult.skipped.length > 0 && (
+              <div className="pb-conflict-box">
+                <AlertTriangle size={16} />
                 <div>
-                  {conflict.team} with {conflict.coach}, {minutesToLabel(timeToMinutes(conflict.start))}–
-                  {minutesToLabel(timeToMinutes(conflict.end))}
+                  <strong>
+                    {seriesResult.skipped.length} week{seriesResult.skipped.length > 1 ? "s" : ""} already booked —
+                    skipped:
+                  </strong>
+                  <ul className="pb-skip-list">
+                    {seriesResult.skipped.map((s) => (
+                      <li key={s.date}>
+                        {new Date(s.date + "T00:00:00").toLocaleDateString(undefined, {
+                          weekday: "short",
+                          day: "numeric",
+                          month: "short",
+                        })}{" "}
+                        — {s.conflict.team} ({s.conflict.coach})
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               </div>
+            )}
+            <button className="pb-btn-primary pb-submit" onClick={onClose}>
+              Done
+            </button>
+          </div>
+        ) : (
+          <form onSubmit={submit} className="pb-form">
+            <label>
+              Pitch
+              <select value={pitchId} onChange={(e) => setPitchId(e.target.value)}>
+                {pitches.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Date
+              <input type="date" value={date} onChange={(e) => setDate(e.target.value)} required />
+            </label>
+            <div className="pb-form-row">
+              <label>
+                Start
+                <input type="time" value={start} onChange={(e) => setStart(e.target.value)} required />
+              </label>
+              <label>
+                End
+                <input type="time" value={end} onChange={(e) => setEnd(e.target.value)} required />
+              </label>
             </div>
-          )}
+            {invalidTime && <div className="pb-inline-warning">End time must be after start time.</div>}
+            <label>
+              Team / session
+              <input
+                type="text"
+                placeholder="e.g. U13 Boys training"
+                value={team}
+                onChange={(e) => setTeam(e.target.value)}
+                required
+              />
+            </label>
+            <label>
+              Coach
+              <input
+                type="text"
+                placeholder="Your name"
+                value={coach}
+                onChange={(e) => setCoach(e.target.value)}
+                required
+              />
+            </label>
+            <label>
+              Repeat weekly
+              <select value={repeatWeeks} onChange={(e) => setRepeatWeeks(Number(e.target.value))}>
+                <option value={1}>Just this week</option>
+                {REPEAT_OPTIONS.filter((n) => n > 1).map((n) => (
+                  <option key={n} value={n}>
+                    {n} weeks (same day &amp; time)
+                  </option>
+                ))}
+              </select>
+            </label>
+            {repeatWeeks > 1 && (
+              <p className="pb-repeat-hint">
+                Books every {new Date(date + "T00:00:00").toLocaleDateString(undefined, { weekday: "long" })} for{" "}
+                {repeatWeeks} weeks from {new Date(date + "T00:00:00").toLocaleDateString(undefined, {
+                  day: "numeric",
+                  month: "short",
+                })}
+                . Any week that's already booked will be skipped and listed for you.
+              </p>
+            )}
+            <label>
+              Notes <span className="pb-optional">(optional)</span>
+              <textarea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} />
+            </label>
 
-          <button type="submit" className="pb-btn-primary pb-submit" disabled={saving}>
-            {saving ? "Saving…" : "Confirm booking"}
-          </button>
-        </form>
+            {conflict && (
+              <div className="pb-conflict-box">
+                <AlertTriangle size={16} />
+                <div>
+                  <strong>That pitch is already booked then.</strong>
+                  <div>
+                    {conflict.team} with {conflict.coach}, {minutesToLabel(timeToMinutes(conflict.start))}–
+                    {minutesToLabel(timeToMinutes(conflict.end))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <button type="submit" className="pb-btn-primary pb-submit" disabled={saving}>
+              {saving ? "Saving…" : repeatWeeks > 1 ? `Confirm ${repeatWeeks} bookings` : "Confirm booking"}
+            </button>
+          </form>
+        )}
       </div>
     </div>
   );
@@ -737,13 +848,13 @@ const css = `
 @import url('https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap');
 
 .pb-root {
-  --pitch-dark: #10261C;
-  --pitch-mid: #1B4332;
-  --pitch-line: #C9CDC5;
-  --chalk: #F7F8F3;
-  --charcoal: #16211C;
-  --clay: #C1502E;
-  --amber: #E9B44C;
+  --pitch-dark: #0D0D0D;
+  --pitch-mid: #C8102E;
+  --pitch-line: #DCD5D5;
+  --chalk: #F7F5F3;
+  --charcoal: #181111;
+  --clay: #B45309;
+  --amber: #C8102E;
   --card-bg: #FFFFFF;
   font-family: 'Inter', system-ui, sans-serif;
   background: var(--chalk);
@@ -790,8 +901,8 @@ const css = `
 .pb-header h1 {
   font-family: 'Oswald', sans-serif;
   font-weight: 600;
-  font-size: 26px;
-  letter-spacing: 0.5px;
+  font-size: 21px;
+  letter-spacing: 0.4px;
   margin: 0;
   text-transform: uppercase;
 }
@@ -1000,7 +1111,7 @@ const css = `
   position: absolute;
   left: 56px;
   right: 12px;
-  border-top: 2px solid var(--clay);
+  border-top: 2px solid var(--pitch-mid);
 }
 .pb-now-dot {
   position: absolute;
@@ -1009,7 +1120,7 @@ const css = `
   width: 9px;
   height: 9px;
   border-radius: 50%;
-  background: var(--clay);
+  background: var(--pitch-mid);
 }
 
 .pb-fab {
@@ -1109,6 +1220,28 @@ const css = `
   color: #8C3A1E;
 }
 .pb-conflict-box strong { display: block; margin-bottom: 2px; }
+
+.pb-repeat-hint {
+  font-size: 12px;
+  color: #6B5B5B;
+  margin: -4px 0 0;
+  line-height: 1.4;
+}
+
+.pb-series-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: 14px;
+}
+.pb-series-summary p { margin: 0; }
+.pb-skip-list {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
 
 .pb-btn-primary {
   background: var(--pitch-mid);
