@@ -159,6 +159,8 @@ function buildMonthPdf(monthValue, clubName, pitches, bookings) {
 
 export default function PitchBooker() {
   const [pitches, setPitches] = useState(null);
+  const [teams, setTeams] = useState(null);
+  const [coaches, setCoaches] = useState(null);
   const [bookings, setBookings] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -194,6 +196,29 @@ export default function PitchBooker() {
     return (data || []).map((r) => ({ id: r.id, name: r.name }));
   }, []);
 
+  // Teams and coaches are optional add-on tables (see migration_teams_coaches.sql).
+  // If they haven't been created yet, fail quietly to an empty list rather than
+  // breaking the whole app.
+  const fetchTeams = useCallback(async () => {
+    try {
+      const { data, error: err } = await supabase.from("teams").select("*").order("sort_order", { ascending: true });
+      if (err) throw err;
+      return (data || []).map((r) => ({ id: r.id, name: r.name }));
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const fetchCoaches = useCallback(async () => {
+    try {
+      const { data, error: err } = await supabase.from("coaches").select("*").order("sort_order", { ascending: true });
+      if (err) throw err;
+      return (data || []).map((r) => ({ id: r.id, name: r.name, email: r.email || "" }));
+    } catch {
+      return [];
+    }
+  }, []);
+
   const fetchBookings = useCallback(async () => {
     const { data, error: err } = await supabase.from("bookings").select("*").order("date", { ascending: true });
     if (err) throw err;
@@ -204,6 +229,8 @@ export default function PitchBooker() {
   useEffect(() => {
     if (!supabaseConfigured) {
       setPitches(DEFAULT_PITCHES);
+      setTeams([]);
+      setCoaches([]);
       setBookings([]);
       setError("Not connected to the database yet — set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.");
       setLoading(false);
@@ -220,6 +247,8 @@ export default function PitchBooker() {
           p = await fetchPitches();
         }
         setPitches(p);
+        setTeams(await fetchTeams());
+        setCoaches(await fetchCoaches());
 
         const b = await fetchBookings();
         setBookings(b);
@@ -227,12 +256,14 @@ export default function PitchBooker() {
         console.error(e);
         setError("Couldn't load the pitch book. Check your connection and try reloading.");
         setPitches(DEFAULT_PITCHES);
+        setTeams([]);
+        setCoaches([]);
         setBookings([]);
       } finally {
         setLoading(false);
       }
     })();
-  }, [fetchPitches, fetchBookings]);
+  }, [fetchPitches, fetchTeams, fetchCoaches, fetchBookings]);
 
   // ---- realtime: keep every coach's screen in sync automatically ----
   useEffect(() => {
@@ -253,12 +284,26 @@ export default function PitchBooker() {
           // ignore
         }
       })
+      .on("postgres_changes", { event: "*", schema: "public", table: "teams" }, async () => {
+        try {
+          setTeams(await fetchTeams());
+        } catch {
+          // ignore
+        }
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "coaches" }, async () => {
+        try {
+          setCoaches(await fetchCoaches());
+        } catch {
+          // ignore
+        }
+      })
       .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [fetchBookings, fetchPitches]);
+  }, [fetchBookings, fetchPitches, fetchTeams, fetchCoaches]);
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 60000);
@@ -291,6 +336,56 @@ export default function PitchBooker() {
       }
     },
     [pitches]
+  );
+
+  const saveTeams = useCallback(
+    async (next) => {
+      const previous = teams || [];
+      setTeams(next);
+      if (!supabaseConfigured) return;
+      try {
+        const nextIds = new Set(next.map((t) => t.id));
+        const removed = previous.filter((t) => !nextIds.has(t.id));
+        const upserts = next.map((t, i) => ({ id: t.id, name: t.name, sort_order: i }));
+        if (upserts.length) {
+          const { error: err } = await supabase.from("teams").upsert(upserts);
+          if (err) throw err;
+        }
+        for (const t of removed) {
+          const { error: err } = await supabase.from("teams").delete().eq("id", t.id);
+          if (err) throw err;
+        }
+      } catch (e) {
+        console.error(e);
+        setError("Couldn't save team changes. Have you run migration_teams_coaches.sql yet?");
+      }
+    },
+    [teams]
+  );
+
+  const saveCoaches = useCallback(
+    async (next) => {
+      const previous = coaches || [];
+      setCoaches(next);
+      if (!supabaseConfigured) return;
+      try {
+        const nextIds = new Set(next.map((c) => c.id));
+        const removed = previous.filter((c) => !nextIds.has(c.id));
+        const upserts = next.map((c, i) => ({ id: c.id, name: c.name, email: c.email || "", sort_order: i }));
+        if (upserts.length) {
+          const { error: err } = await supabase.from("coaches").upsert(upserts);
+          if (err) throw err;
+        }
+        for (const c of removed) {
+          const { error: err } = await supabase.from("coaches").delete().eq("id", c.id);
+          if (err) throw err;
+        }
+      } catch (e) {
+        console.error(e);
+        setError("Couldn't save coach changes. Have you run migration_teams_coaches.sql yet?");
+      }
+    },
+    [coaches]
   );
 
   const weekDays = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)), [weekStart]);
@@ -453,7 +548,7 @@ export default function PitchBooker() {
           <button className="pb-icon-btn" onClick={() => setPdfOpen(true)} aria-label="Download month PDF">
             <Download size={18} />
           </button>
-          <button className="pb-icon-btn" onClick={() => setManageOpen(true)} aria-label="Manage pitches">
+          <button className="pb-icon-btn" onClick={() => setManageOpen(true)} aria-label="Manage pitches, teams and coaches">
             <Settings2 size={18} />
           </button>
         </div>
@@ -554,6 +649,8 @@ export default function PitchBooker() {
       {modalOpen && (
         <BookingModal
           pitches={pitches}
+          teams={teams || []}
+          coaches={coaches || []}
           defaultDate={selectedDate}
           onClose={() => setModalOpen(false)}
           onSave={handleSaveBooking}
@@ -570,7 +667,15 @@ export default function PitchBooker() {
       )}
 
       {manageOpen && (
-        <ManagePitchesModal pitches={pitches} onClose={() => setManageOpen(false)} onSave={savePitches} />
+        <ManageListsModal
+          pitches={pitches}
+          teams={teams || []}
+          coaches={coaches || []}
+          onClose={() => setManageOpen(false)}
+          onSavePitches={savePitches}
+          onSaveTeams={saveTeams}
+          onSaveCoaches={saveCoaches}
+        />
       )}
 
       {pdfOpen && (
@@ -739,7 +844,7 @@ function MonthPdfModal({ defaultMonth, pitches, bookings, onClose }) {
 
 // ---------- Booking modal ----------
 
-function BookingModal({ pitches, defaultDate, onClose, onSave }) {
+function BookingModal({ pitches, teams, coaches, defaultDate, onClose, onSave }) {
   const [pitchId, setPitchId] = useState(pitches[0]?.id || "");
   const [date, setDate] = useState(defaultDate);
   const [start, setStart] = useState("18:00");
@@ -858,21 +963,33 @@ function BookingModal({ pitches, defaultDate, onClose, onSave }) {
               Team / session
               <input
                 type="text"
+                list="pb-team-suggestions"
                 placeholder="e.g. U13 Boys training"
                 value={team}
                 onChange={(e) => setTeam(e.target.value)}
                 required
               />
+              <datalist id="pb-team-suggestions">
+                {teams.map((t) => (
+                  <option key={t.id} value={t.name} />
+                ))}
+              </datalist>
             </label>
             <label>
               Coach
               <input
                 type="text"
+                list="pb-coach-suggestions"
                 placeholder="Your name"
                 value={coach}
                 onChange={(e) => setCoach(e.target.value)}
                 required
               />
+              <datalist id="pb-coach-suggestions">
+                {coaches.map((c) => (
+                  <option key={c.id} value={c.name} />
+                ))}
+              </datalist>
             </label>
             <label>
               Repeat weekly
@@ -985,66 +1102,163 @@ function DetailModal({ booking, pitch, onClose, onDelete }) {
   );
 }
 
-// ---------- Manage pitches modal ----------
+// ---------- Manage lists modal (Pitches / Teams / Coaches) ----------
 
-function ManagePitchesModal({ pitches, onClose, onSave }) {
-  const [list, setList] = useState(pitches);
+function SimpleNameListEditor({ items, onSave, label, placeholder }) {
+  const [list, setList] = useState(items);
   const [newName, setNewName] = useState("");
+  const [saving, setSaving] = useState(false);
 
-  function addPitch() {
+  function add() {
     const name = newName.trim();
     if (!name) return;
     setList([...list, { id: genId(), name }]);
     setNewName("");
   }
 
-  function removePitch(id) {
+  function remove(id) {
     setList(list.filter((p) => p.id !== id));
   }
 
-  function renamePitch(id, name) {
+  function rename(id, name) {
     setList(list.map((p) => (p.id === id ? { ...p, name } : p)));
   }
 
   async function save() {
+    setSaving(true);
     await onSave(list);
-    onClose();
+    setSaving(false);
   }
+
+  return (
+    <div>
+      <div className="pb-pitch-list">
+        {list.map((p) => (
+          <div key={p.id} className="pb-pitch-row">
+            <input value={p.name} onChange={(e) => rename(p.id, e.target.value)} />
+            <button className="pb-icon-btn" onClick={() => remove(p.id)} aria-label={`Remove ${label}`}>
+              <Trash2 size={16} />
+            </button>
+          </div>
+        ))}
+        {list.length === 0 && <p className="pb-manage-note">None added yet.</p>}
+      </div>
+      <div className="pb-add-pitch-row">
+        <input
+          placeholder={placeholder}
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), add())}
+        />
+        <button className="pb-btn-ghost" onClick={add}>
+          <Plus size={16} /> Add
+        </button>
+      </div>
+      <button className="pb-btn-primary pb-submit" onClick={save} disabled={saving}>
+        {saving ? "Saving…" : `Save ${label}s`}
+      </button>
+    </div>
+  );
+}
+
+function CoachListEditor({ items, onSave }) {
+  const [list, setList] = useState(items);
+  const [newName, setNewName] = useState("");
+  const [newEmail, setNewEmail] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  function add() {
+    const name = newName.trim();
+    if (!name) return;
+    setList([...list, { id: genId(), name, email: newEmail.trim() }]);
+    setNewName("");
+    setNewEmail("");
+  }
+
+  function remove(id) {
+    setList(list.filter((c) => c.id !== id));
+  }
+
+  function update(id, field, value) {
+    setList(list.map((c) => (c.id === id ? { ...c, [field]: value } : c)));
+  }
+
+  async function save() {
+    setSaving(true);
+    await onSave(list);
+    setSaving(false);
+  }
+
+  return (
+    <div>
+      <div className="pb-pitch-list">
+        {list.map((c) => (
+          <div key={c.id} className="pb-coach-row">
+            <input value={c.name} placeholder="Name" onChange={(e) => update(c.id, "name", e.target.value)} />
+            <input
+              value={c.email || ""}
+              placeholder="Email (optional, for later)"
+              onChange={(e) => update(c.id, "email", e.target.value)}
+            />
+            <button className="pb-icon-btn" onClick={() => remove(c.id)} aria-label="Remove coach">
+              <Trash2 size={16} />
+            </button>
+          </div>
+        ))}
+        {list.length === 0 && <p className="pb-manage-note">None added yet.</p>}
+      </div>
+      <div className="pb-add-coach-row">
+        <input placeholder="Name" value={newName} onChange={(e) => setNewName(e.target.value)} />
+        <input
+          placeholder="Email (optional)"
+          value={newEmail}
+          onChange={(e) => setNewEmail(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), add())}
+        />
+        <button className="pb-btn-ghost" onClick={add}>
+          <Plus size={16} /> Add
+        </button>
+      </div>
+      <button className="pb-btn-primary pb-submit" onClick={save} disabled={saving}>
+        {saving ? "Saving…" : "Save coaches"}
+      </button>
+    </div>
+  );
+}
+
+function ManageListsModal({ pitches, teams, coaches, onClose, onSavePitches, onSaveTeams, onSaveCoaches }) {
+  const [tab, setTab] = useState("pitches");
 
   return (
     <div className="pb-overlay" onClick={onClose}>
       <div className="pb-modal" onClick={(e) => e.stopPropagation()}>
         <div className="pb-modal-head">
-          <h2>Manage pitches</h2>
+          <h2>Manage lists</h2>
           <button className="pb-icon-btn" onClick={onClose}>
             <X size={18} />
           </button>
         </div>
-        <p className="pb-manage-note">Changes here are visible to every coach using this booker.</p>
-        <div className="pb-pitch-list">
-          {list.map((p) => (
-            <div key={p.id} className="pb-pitch-row">
-              <input value={p.name} onChange={(e) => renamePitch(p.id, e.target.value)} />
-              <button className="pb-icon-btn" onClick={() => removePitch(p.id)} aria-label="Remove pitch">
-                <Trash2 size={16} />
-              </button>
-            </div>
-          ))}
-        </div>
-        <div className="pb-add-pitch-row">
-          <input
-            placeholder="New pitch name"
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), addPitch())}
-          />
-          <button className="pb-btn-ghost" onClick={addPitch}>
-            <Plus size={16} /> Add
+        <p className="pb-manage-note">Changes here are visible to everyone using this booker.</p>
+
+        <div className="pb-tab-row">
+          <button className={`pb-toggle-btn ${tab === "pitches" ? "active" : ""}`} onClick={() => setTab("pitches")}>
+            Pitches
+          </button>
+          <button className={`pb-toggle-btn ${tab === "teams" ? "active" : ""}`} onClick={() => setTab("teams")}>
+            Teams
+          </button>
+          <button className={`pb-toggle-btn ${tab === "coaches" ? "active" : ""}`} onClick={() => setTab("coaches")}>
+            Coaches
           </button>
         </div>
-        <button className="pb-btn-primary pb-submit" onClick={save}>
-          Save pitches
-        </button>
+
+        {tab === "pitches" && (
+          <SimpleNameListEditor items={pitches} onSave={onSavePitches} label="pitch" placeholder="New pitch name" />
+        )}
+        {tab === "teams" && (
+          <SimpleNameListEditor items={teams} onSave={onSaveTeams} label="team" placeholder="New team / session name" />
+        )}
+        {tab === "coaches" && <CoachListEditor items={coaches} onSave={onSaveCoaches} />}
       </div>
     </div>
   );
@@ -1657,5 +1871,30 @@ const css = `
   border-radius: 8px;
   border: 1px solid var(--pitch-line);
   font-size: 14px;
+}
+
+.pb-tab-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.pb-coach-row { display: flex; gap: 8px; align-items: center; }
+.pb-coach-row input {
+  flex: 1;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--pitch-line);
+  font-size: 14px;
+  min-width: 0;
+}
+.pb-add-coach-row { display: flex; gap: 8px; margin-bottom: 14px; }
+.pb-add-coach-row input {
+  flex: 1;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--pitch-line);
+  font-size: 14px;
+  min-width: 0;
 }
 `;
