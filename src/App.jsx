@@ -12,6 +12,8 @@ import {
   Download,
   CalendarRange,
   Grid3x3,
+  ClipboardCheck,
+  Lock,
 } from "lucide-react";
 import jsPDF from "jspdf";
 import { supabase, supabaseConfigured } from "./supabaseClient";
@@ -27,6 +29,11 @@ const REPEAT_OPTIONS = [1, 2, 3, 4, 5, 6, 8, 10, 12];
 const DEFAULT_PITCHES = [
   { id: "p1", name: "Main Pitch" },
   { id: "p2", name: "Training Pitch" },
+];
+
+const DEFAULT_TEAMS = [
+  { id: "t1", name: "U13 Boys Training" },
+  { id: "t2", name: "U12 Girls Training" },
 ];
 
 // ---------- date helpers ----------
@@ -149,7 +156,8 @@ function buildMonthPdf(monthValue, clubName, pitches, bookings) {
       const time = `${minutesToLabel(timeToMinutes(b.start))}\u2013${minutesToLabel(timeToMinutes(b.end))}`;
       doc.text(time, marginX + 10, y);
       doc.text(pitchName(b.pitchId), marginX + 90, y);
-      doc.text(`${b.team} (${b.coach})`, marginX + 230, y);
+      const teamLabel = b.status === "pending" ? `${b.team} (${b.coach}) — PENDING` : `${b.team} (${b.coach})`;
+      doc.text(teamLabel, marginX + 230, y);
       y += 15;
     }
   }
@@ -171,6 +179,8 @@ export default function PitchBooker() {
   const [modalOpen, setModalOpen] = useState(false);
   const [manageOpen, setManageOpen] = useState(false);
   const [pdfOpen, setPdfOpen] = useState(false);
+  const [approvalsOpen, setApprovalsOpen] = useState(false);
+  const [adminPasscode, setAdminPasscode] = useState(null); // held in memory only, never persisted
   const [viewMode, setViewMode] = useState("day"); // "day" | "week"
   const [detailBooking, setDetailBooking] = useState(null);
   const [now, setNow] = useState(new Date());
@@ -186,6 +196,7 @@ export default function PitchBooker() {
       coach: row.coach,
       team: row.team,
       notes: row.notes || "",
+      status: row.status || "approved",
       createdAt: row.created_at,
     };
   }
@@ -247,7 +258,19 @@ export default function PitchBooker() {
           p = await fetchPitches();
         }
         setPitches(p);
-        setTeams(await fetchTeams());
+
+        let t = await fetchTeams();
+        if (!t.length) {
+          try {
+            await supabase.from("teams").insert(
+              DEFAULT_TEAMS.map((team, i) => ({ id: team.id, name: team.name, sort_order: i }))
+            );
+            t = await fetchTeams();
+          } catch {
+            // teams table may not exist yet if migration hasn't been run - fine, just empty
+          }
+        }
+        setTeams(t);
         setCoaches(await fetchCoaches());
 
         const b = await fetchBookings();
@@ -392,8 +415,20 @@ export default function PitchBooker() {
 
   const dayBookings = useMemo(() => {
     if (!bookings) return [];
-    return bookings.filter((b) => b.date === selectedDate).sort((a, b) => a.start.localeCompare(b.start));
+    return bookings
+      .filter((b) => b.date === selectedDate && b.status !== "rejected" && b.status !== "cancelled")
+      .sort((a, b) => a.start.localeCompare(b.start));
   }, [bookings, selectedDate]);
+
+  const visibleBookings = useMemo(() => {
+    if (!bookings) return [];
+    return bookings.filter((b) => b.status !== "rejected" && b.status !== "cancelled");
+  }, [bookings]);
+
+  const pendingBookings = useMemo(() => {
+    if (!bookings) return [];
+    return bookings.filter((b) => b.status === "pending").sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start));
+  }, [bookings]);
 
   const isToday = selectedDate === toISODate(new Date());
 
@@ -426,7 +461,7 @@ export default function PitchBooker() {
         .eq("pitch_id", form.pitchId)
         .in("date", dates);
       if (fetchErr) throw fetchErr;
-      const live = data.map(rowToBooking);
+      const live = data.map(rowToBooking).filter((b) => b.status !== "rejected" && b.status !== "cancelled");
 
       if (dates.length === 1) {
         const liveConflict = findConflict(live, form.pitchId, form.date, form.start, form.end, editingId);
@@ -448,7 +483,7 @@ export default function PitchBooker() {
           const { error: err } = await supabase.from("bookings").update(row).eq("id", editingId);
           if (err) throw err;
         } else {
-          const { error: err } = await supabase.from("bookings").insert({ id: genId(), ...row });
+          const { error: err } = await supabase.from("bookings").insert({ id: genId(), status: "pending", ...row });
           if (err) throw err;
         }
 
@@ -473,6 +508,7 @@ export default function PitchBooker() {
             coach: form.coach,
             team: form.team,
             notes: form.notes || "",
+            status: "pending",
           });
         }
       }
@@ -497,7 +533,7 @@ export default function PitchBooker() {
       return;
     }
     try {
-      const { error: err } = await supabase.from("bookings").delete().eq("id", id);
+      const { error: err } = await supabase.from("bookings").update({ status: "cancelled" }).eq("id", id);
       if (err) throw err;
       setBookings(await fetchBookings());
     } catch (e) {
@@ -505,6 +541,45 @@ export default function PitchBooker() {
       setError("Couldn't cancel the booking. Try again.");
     } finally {
       setDetailBooking(null);
+    }
+  }
+
+  // ---- admin approval ----
+  async function verifyPasscode(passcode) {
+    if (!supabaseConfigured) return false;
+    try {
+      const { data, error: err } = await supabase.rpc("verify_admin_passcode", { input_passcode: passcode });
+      if (err) throw err;
+      return Boolean(data);
+    } catch (e) {
+      console.error(e);
+      return false;
+    }
+  }
+
+  async function approveBooking(id, passcode) {
+    try {
+      const { data, error: err } = await supabase.rpc("approve_booking", { target_id: id, input_passcode: passcode });
+      if (err) throw err;
+      if (data) setBookings(await fetchBookings());
+      return Boolean(data);
+    } catch (e) {
+      console.error(e);
+      setError("Couldn't approve the booking.");
+      return false;
+    }
+  }
+
+  async function rejectBooking(id, passcode) {
+    try {
+      const { data, error: err } = await supabase.rpc("reject_booking", { target_id: id, input_passcode: passcode });
+      if (err) throw err;
+      if (data) setBookings(await fetchBookings());
+      return Boolean(data);
+    } catch (e) {
+      console.error(e);
+      setError("Couldn't reject the booking.");
+      return false;
     }
   }
 
@@ -545,6 +620,10 @@ export default function PitchBooker() {
             <h1>Drogheda Town FC</h1>
             <p className="pb-sub">Pitch booking — see who's on before you turn up.</p>
           </div>
+          <button className="pb-icon-btn pb-approvals-btn" onClick={() => setApprovalsOpen(true)} aria-label="Approvals">
+            <ClipboardCheck size={18} />
+            {pendingBookings.length > 0 && <span className="pb-badge">{pendingBookings.length}</span>}
+          </button>
           <button className="pb-icon-btn" onClick={() => setPdfOpen(true)} aria-label="Download month PDF">
             <Download size={18} />
           </button>
@@ -638,7 +717,7 @@ export default function PitchBooker() {
           onSelectBooking={setDetailBooking}
         />
       ) : (
-        <WeekAgenda weekDays={weekDays} pitches={pitches} bookings={bookings} onSelectBooking={setDetailBooking} />
+        <WeekAgenda weekDays={weekDays} pitches={pitches} bookings={visibleBookings} onSelectBooking={setDetailBooking} />
       )}
 
       <button className="pb-fab" onClick={() => setModalOpen(true)}>
@@ -682,8 +761,25 @@ export default function PitchBooker() {
         <MonthPdfModal
           defaultMonth={selectedDate.slice(0, 7)}
           pitches={pitches}
-          bookings={bookings}
+          bookings={visibleBookings}
           onClose={() => setPdfOpen(false)}
+        />
+      )}
+
+      {approvalsOpen && (
+        <ApprovalsModal
+          pendingBookings={pendingBookings}
+          allBookings={bookings || []}
+          pitches={pitches}
+          adminPasscode={adminPasscode}
+          onUnlock={async (code) => {
+            const ok = await verifyPasscode(code);
+            if (ok) setAdminPasscode(code);
+            return ok;
+          }}
+          onApprove={(id) => approveBooking(id, adminPasscode)}
+          onReject={(id) => rejectBooking(id, adminPasscode)}
+          onClose={() => setApprovalsOpen(false)}
         />
       )}
     </div>
@@ -730,15 +826,17 @@ function ScheduleGrid({ pitches, dayBookings, isToday, now, onSelectBooking }) {
                   {items.map((b) => {
                     const top = (timeToMinutes(b.start) - DAY_START * 60) * pxPerMin;
                     const height = Math.max((timeToMinutes(b.end) - timeToMinutes(b.start)) * pxPerMin, 26);
+                    const pending = b.status === "pending";
                     return (
                       <button
                         key={b.id}
-                        className="pb-booking-block"
+                        className={`pb-booking-block ${pending ? "pending" : ""}`}
                         style={{ top, height, background: color }}
                         onClick={() => onSelectBooking(b)}
                       >
                         <span className="pb-block-time">
                           {minutesToLabel(timeToMinutes(b.start))}–{minutesToLabel(timeToMinutes(b.end))}
+                          {pending && <span className="pb-pending-tag">PENDING</span>}
                         </span>
                         <span className="pb-block-team">{b.team}</span>
                         <span className="pb-block-coach">{b.coach}</span>
@@ -790,6 +888,7 @@ function WeekAgenda({ weekDays, pitches, bookings, onSelectBooking }) {
                         <span className="pb-week-dot" style={{ background: color }} />
                         <span className="pb-week-time">
                           {minutesToLabel(timeToMinutes(b.start))}–{minutesToLabel(timeToMinutes(b.end))}
+                          {b.status === "pending" && <span className="pb-pending-tag">PENDING</span>}
                         </span>
                         <span className="pb-week-pitch">{pitches.find((p) => p.id === b.pitchId)?.name}</span>
                         <span className="pb-week-team">{b.team}</span>
@@ -849,8 +948,8 @@ function BookingModal({ pitches, teams, coaches, defaultDate, onClose, onSave })
   const [date, setDate] = useState(defaultDate);
   const [start, setStart] = useState("18:00");
   const [end, setEnd] = useState("19:00");
-  const [coach, setCoach] = useState("");
-  const [team, setTeam] = useState("");
+  const [coach, setCoach] = useState(coaches[0]?.name || "");
+  const [team, setTeam] = useState(teams[0]?.name || "");
   const [notes, setNotes] = useState("");
   const [repeatWeeks, setRepeatWeeks] = useState(1);
   const [conflict, setConflict] = useState(null);
@@ -961,35 +1060,35 @@ function BookingModal({ pitches, teams, coaches, defaultDate, onClose, onSave })
             {invalidTime && <div className="pb-inline-warning">End time must be after start time.</div>}
             <label>
               Team / session
-              <input
-                type="text"
-                list="pb-team-suggestions"
-                placeholder="e.g. U13 Boys training"
-                value={team}
-                onChange={(e) => setTeam(e.target.value)}
-                required
-              />
-              <datalist id="pb-team-suggestions">
-                {teams.map((t) => (
-                  <option key={t.id} value={t.name} />
-                ))}
-              </datalist>
+              {teams.length === 0 ? (
+                <p className="pb-inline-warning">
+                  No teams set up yet — add one via the gear icon first.
+                </p>
+              ) : (
+                <select value={team} onChange={(e) => setTeam(e.target.value)} required>
+                  {teams.map((t) => (
+                    <option key={t.id} value={t.name}>
+                      {t.name}
+                    </option>
+                  ))}
+                </select>
+              )}
             </label>
             <label>
               Coach
-              <input
-                type="text"
-                list="pb-coach-suggestions"
-                placeholder="Your name"
-                value={coach}
-                onChange={(e) => setCoach(e.target.value)}
-                required
-              />
-              <datalist id="pb-coach-suggestions">
-                {coaches.map((c) => (
-                  <option key={c.id} value={c.name} />
-                ))}
-              </datalist>
+              {coaches.length === 0 ? (
+                <p className="pb-inline-warning">
+                  No coaches set up yet — add one via the gear icon first.
+                </p>
+              ) : (
+                <select value={coach} onChange={(e) => setCoach(e.target.value)} required>
+                  {coaches.map((c) => (
+                    <option key={c.id} value={c.name}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              )}
             </label>
             <label>
               Repeat weekly
@@ -1055,6 +1154,12 @@ function DetailModal({ booking, pitch, onClose, onDelete }) {
         </div>
         <div className="pb-detail">
           <div className="pb-detail-row">
+            <span className="pb-detail-label">Status</span>
+            <span className={`pb-status-tag ${booking.status === "pending" ? "pending" : "approved"}`}>
+              {booking.status === "pending" ? "Pending approval" : "Approved"}
+            </span>
+          </div>
+          <div className="pb-detail-row">
             <span className="pb-detail-label">When</span>
             <span>
               {new Date(booking.date + "T00:00:00").toLocaleDateString(undefined, {
@@ -1095,6 +1200,144 @@ function DetailModal({ booking, pitch, onClose, onDelete }) {
             <button className="pb-btn-ghost" onClick={() => setConfirming(false)}>
               Keep it
             </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Approvals modal ----------
+
+function ApprovalsModal({ pendingBookings, allBookings, pitches, adminPasscode, onUnlock, onApprove, onReject, onClose }) {
+  const [passcodeInput, setPasscodeInput] = useState("");
+  const [unlockError, setUnlockError] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [busyId, setBusyId] = useState(null);
+  const [confirmOverride, setConfirmOverride] = useState(null); // booking id needing a clash override
+
+  async function submitPasscode(e) {
+    e.preventDefault();
+    setChecking(true);
+    setUnlockError(false);
+    const ok = await onUnlock(passcodeInput);
+    setChecking(false);
+    if (!ok) setUnlockError(true);
+  }
+
+  function pitchName(id) {
+    return pitches.find((p) => p.id === id)?.name || "Pitch";
+  }
+
+  function findApprovedClash(booking) {
+    return allBookings.find(
+      (b) =>
+        b.id !== booking.id &&
+        b.status === "approved" &&
+        b.pitchId === booking.pitchId &&
+        b.date === booking.date &&
+        overlaps(timeToMinutes(booking.start), timeToMinutes(booking.end), timeToMinutes(b.start), timeToMinutes(b.end))
+    );
+  }
+
+  async function handleApprove(booking) {
+    const clash = findApprovedClash(booking);
+    if (clash && confirmOverride !== booking.id) {
+      setConfirmOverride(booking.id);
+      return;
+    }
+    setBusyId(booking.id);
+    await onApprove(booking.id);
+    setBusyId(null);
+    setConfirmOverride(null);
+  }
+
+  async function handleReject(booking) {
+    setBusyId(booking.id);
+    await onReject(booking.id);
+    setBusyId(null);
+  }
+
+  return (
+    <div className="pb-overlay" onClick={onClose}>
+      <div className="pb-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="pb-modal-head">
+          <h2>Approvals</h2>
+          <button className="pb-icon-btn" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </div>
+
+        {!adminPasscode ? (
+          <form onSubmit={submitPasscode} className="pb-form">
+            <p className="pb-manage-note">
+              <Lock size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />
+              Enter the admin passcode to review pending requests.
+            </p>
+            <label>
+              Passcode
+              <input
+                type="password"
+                value={passcodeInput}
+                onChange={(e) => setPasscodeInput(e.target.value)}
+                autoFocus
+              />
+            </label>
+            {unlockError && <div className="pb-inline-warning">That passcode isn't right.</div>}
+            <button type="submit" className="pb-btn-primary pb-submit" disabled={checking}>
+              {checking ? "Checking…" : "Unlock"}
+            </button>
+          </form>
+        ) : pendingBookings.length === 0 ? (
+          <p className="pb-manage-note">No pending requests right now — you're all caught up.</p>
+        ) : (
+          <div className="pb-approvals-list">
+            {pendingBookings.map((b) => {
+              const clash = findApprovedClash(b);
+              const busy = busyId === b.id;
+              return (
+                <div key={b.id} className="pb-approval-card">
+                  <div className="pb-approval-info">
+                    <div className="pb-approval-when">
+                      {new Date(b.date + "T00:00:00").toLocaleDateString(undefined, {
+                        weekday: "short",
+                        day: "numeric",
+                        month: "short",
+                      })}
+                      , {minutesToLabel(timeToMinutes(b.start))}–{minutesToLabel(timeToMinutes(b.end))} ·{" "}
+                      {pitchName(b.pitchId)}
+                    </div>
+                    <div className="pb-approval-team">{b.team}</div>
+                    <div className="pb-approval-coach">Requested by {b.coach}</div>
+                    {b.notes && <div className="pb-approval-notes">{b.notes}</div>}
+                  </div>
+                  {clash && (
+                    <div className="pb-conflict-box">
+                      <AlertTriangle size={16} />
+                      <div>
+                        <strong>Clashes with an approved booking</strong>
+                        <div>
+                          {clash.team} ({clash.coach}), {minutesToLabel(timeToMinutes(clash.start))}–
+                          {minutesToLabel(timeToMinutes(clash.end))}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  <div className="pb-approval-actions">
+                    <button
+                      className="pb-btn-primary pb-approval-approve"
+                      onClick={() => handleApprove(b)}
+                      disabled={busy}
+                    >
+                      {busy ? "…" : clash && confirmOverride === b.id ? "Approve anyway" : "Approve"}
+                    </button>
+                    <button className="pb-btn-danger pb-approval-reject" onClick={() => handleReject(b)} disabled={busy}>
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -1350,8 +1593,27 @@ const css = `
   cursor: pointer;
   flex-shrink: 0;
   transition: background 0.15s ease;
+  position: relative;
 }
 .pb-icon-btn:hover { background: rgba(255,255,255,0.16); }
+.pb-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  background: var(--pitch-mid);
+  color: #fff;
+  border: 2px solid var(--pitch-dark);
+  border-radius: 999px;
+  font-family: 'Inter', sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 18px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
 .pb-root > .pb-week-nav .pb-icon-btn,
 .pb-modal .pb-icon-btn {
   background: rgba(16,38,28,0.06);
@@ -1642,6 +1904,29 @@ const css = `
   overflow: hidden;
   box-shadow: 0 1px 3px rgba(0,0,0,0.18);
 }
+.pb-booking-block.pending {
+  opacity: 0.68;
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgba(255,255,255,0.12) 0px,
+    rgba(255,255,255,0.12) 6px,
+    transparent 6px,
+    transparent 12px
+  );
+  box-shadow: 0 0 0 1.5px rgba(255,255,255,0.7) inset, 0 1px 3px rgba(0,0,0,0.18);
+}
+.pb-pending-tag {
+  display: inline-block;
+  margin-left: 5px;
+  font-family: 'Inter', sans-serif;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  background: rgba(0,0,0,0.28);
+  padding: 1px 4px;
+  border-radius: 4px;
+  vertical-align: middle;
+}
 .pb-block-time {
   font-family: 'JetBrains Mono', monospace;
   font-size: 10px;
@@ -1853,6 +2138,44 @@ const css = `
   font-weight: 600;
 }
 .pb-coach-chip { display: flex; align-items: center; gap: 5px; }
+
+.pb-status-tag {
+  display: inline-block;
+  width: fit-content;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 3px 9px;
+  border-radius: 999px;
+}
+.pb-status-tag.approved { background: #E4F2E9; color: #1B4332; }
+.pb-status-tag.pending { background: #FBEFD9; color: #8A5A00; }
+
+.pb-approvals-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.pb-approval-card {
+  border: 1px solid var(--pitch-line);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.pb-approval-when {
+  font-family: 'Oswald', sans-serif;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--pitch-mid);
+}
+.pb-approval-team { font-size: 14px; font-weight: 600; }
+.pb-approval-coach { font-size: 12.5px; color: #6B5B5B; }
+.pb-approval-notes { font-size: 12px; color: #7C6B6B; font-style: italic; }
+.pb-approval-actions { display: flex; gap: 8px; margin-top: 2px; }
+.pb-approval-approve, .pb-approval-reject { flex: 1; }
 
 .pb-manage-note { font-size: 12.5px; color: #6B7C71; margin: 0 0 12px; }
 .pb-pitch-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
