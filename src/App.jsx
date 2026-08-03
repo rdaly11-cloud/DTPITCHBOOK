@@ -1439,7 +1439,7 @@ function ApprovalsModal({ pendingBookings, allBookings, pitches, adminPasscode, 
 
 // ---------- Manage lists modal (Pitches / Teams / Coaches) ----------
 
-function SimpleNameListEditor({ items, onSave, label, placeholder }) {
+function SimpleNameListEditor({ items, onSave, label, labelPlural, placeholder }) {
   const [list, setList] = useState(items);
   const [newName, setNewName] = useState("");
   const [saving, setSaving] = useState(false);
@@ -1490,7 +1490,7 @@ function SimpleNameListEditor({ items, onSave, label, placeholder }) {
         </button>
       </div>
       <button className="pb-btn-primary pb-submit" onClick={save} disabled={saving}>
-        {saving ? "Saving…" : `Save ${label}s`}
+        {saving ? "Saving…" : `Save ${labelPlural}`}
       </button>
     </div>
   );
@@ -1588,10 +1588,22 @@ function ManageListsModal({ pitches, teams, coaches, onClose, onSavePitches, onS
         </div>
 
         {tab === "pitches" && (
-          <SimpleNameListEditor items={pitches} onSave={onSavePitches} label="pitch" placeholder="New pitch name" />
+          <SimpleNameListEditor
+            items={pitches}
+            onSave={onSavePitches}
+            label="pitch"
+            labelPlural="pitches"
+            placeholder="New pitch name"
+          />
         )}
         {tab === "teams" && (
-          <SimpleNameListEditor items={teams} onSave={onSaveTeams} label="team" placeholder="New team / session name" />
+          <SimpleNameListEditor
+            items={teams}
+            onSave={onSaveTeams}
+            label="team"
+            labelPlural="teams"
+            placeholder="New team / session name"
+          />
         )}
         {tab === "coaches" && <CoachListEditor items={coaches} onSave={onSaveCoaches} />}
       </div>
