@@ -14,8 +14,11 @@ import {
   Grid3x3,
   ClipboardCheck,
   Lock,
+  Pencil,
+  FileSpreadsheet,
 } from "lucide-react";
 import jsPDF from "jspdf";
+import * as XLSX from "xlsx";
 import { supabase, supabaseConfigured } from "./supabaseClient";
 
 // ---------- constants ----------
@@ -165,6 +168,53 @@ function buildMonthPdf(monthValue, clubName, pitches, bookings) {
   doc.save(`pitch-bookings-${monthValue}.pdf`);
 }
 
+// ---------- month Excel export ----------
+
+function buildMonthExcel(monthValue, clubName, pitches, bookings) {
+  const [yearStr, monthStr] = monthValue.split("-");
+  const year = Number(yearStr);
+  const monthIndex = Number(monthStr) - 1;
+
+  const monthBookings = bookings
+    .filter((b) => {
+      const d = new Date(b.date + "T00:00:00");
+      return d.getFullYear() === year && d.getMonth() === monthIndex;
+    })
+    .sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start));
+
+  const pitchName = (id) => pitches.find((p) => p.id === id)?.name || "Pitch";
+  const monthLabel = new Date(year, monthIndex, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
+
+  const header = ["Date", "Day", "Start", "End", "Pitch", "Team / Session", "Coach", "Status", "Notes"];
+  const rows = monthBookings.map((b) => {
+    const d = new Date(b.date + "T00:00:00");
+    return [
+      b.date,
+      d.toLocaleDateString(undefined, { weekday: "long" }),
+      minutesToLabel(timeToMinutes(b.start)),
+      minutesToLabel(timeToMinutes(b.end)),
+      pitchName(b.pitchId),
+      b.team,
+      b.coach,
+      b.status === "pending" ? "Pending" : "Approved",
+      b.notes || "",
+    ];
+  });
+
+  const sheetData = [[`${clubName} — Pitch bookings — ${monthLabel}`], [], header, ...rows];
+  const ws = XLSX.utils.aoa_to_sheet(sheetData);
+
+  ws["!cols"] = [
+    { wch: 12 }, { wch: 11 }, { wch: 8 }, { wch: 8 },
+    { wch: 16 }, { wch: 24 }, { wch: 16 }, { wch: 10 }, { wch: 28 },
+  ];
+  ws["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: header.length - 1 } }];
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Bookings");
+  XLSX.writeFile(wb, `pitch-bookings-${monthValue}.xlsx`);
+}
+
 export default function PitchBooker() {
   const [pitches, setPitches] = useState(null);
   const [teams, setTeams] = useState(null);
@@ -183,6 +233,7 @@ export default function PitchBooker() {
   const [adminPasscode, setAdminPasscode] = useState(null); // held in memory only, never persisted
   const [viewMode, setViewMode] = useState("day"); // "day" | "week"
   const [detailBooking, setDetailBooking] = useState(null);
+  const [editingBooking, setEditingBooking] = useState(null);
   const [now, setNow] = useState(new Date());
 
   // ---- helpers to map between DB rows and the shape the UI uses ----
@@ -480,8 +531,16 @@ export default function PitchBooker() {
         };
 
         if (editingId) {
-          const { error: err } = await supabase.from("bookings").update(row).eq("id", editingId);
-          if (err) throw err;
+          // An edit is really "retire the old request, submit the change as a
+          // new one" - a different time/pitch needs its own approval, same as
+          // any other request.
+          const { error: insErr } = await supabase.from("bookings").insert({ id: genId(), status: "pending", ...row });
+          if (insErr) throw insErr;
+          const { error: cancelErr } = await supabase
+            .from("bookings")
+            .update({ status: "cancelled" })
+            .eq("id", editingId);
+          if (cancelErr) throw cancelErr;
         } else {
           const { error: err } = await supabase.from("bookings").insert({ id: genId(), status: "pending", ...row });
           if (err) throw err;
@@ -610,11 +669,7 @@ export default function PitchBooker() {
       <header className="pb-header">
         <div className="pb-header-inner">
           <div className="pb-crest" aria-hidden="true">
-            <svg viewBox="0 0 40 40" width="34" height="34">
-              <circle cx="20" cy="20" r="19" fill="none" stroke="#F8F9F4" strokeWidth="1.4" opacity="0.55" />
-              <line x1="20" y1="1" x2="20" y2="39" stroke="#F8F9F4" strokeWidth="1" opacity="0.4" />
-              <circle cx="20" cy="20" r="6" fill="none" stroke="#F8F9F4" strokeWidth="1" opacity="0.55" />
-            </svg>
+            <img src="/crest.png" alt="" className="pb-crest-img" />
           </div>
           <div>
             <h1>Drogheda Town FC</h1>
@@ -624,7 +679,7 @@ export default function PitchBooker() {
             <ClipboardCheck size={18} />
             {pendingBookings.length > 0 && <span className="pb-badge">{pendingBookings.length}</span>}
           </button>
-          <button className="pb-icon-btn" onClick={() => setPdfOpen(true)} aria-label="Download month PDF">
+          <button className="pb-icon-btn" onClick={() => setPdfOpen(true)} aria-label="Export bookings">
             <Download size={18} />
           </button>
           <button className="pb-icon-btn" onClick={() => setManageOpen(true)} aria-label="Manage pitches, teams and coaches">
@@ -720,7 +775,13 @@ export default function PitchBooker() {
         <WeekAgenda weekDays={weekDays} pitches={pitches} bookings={visibleBookings} onSelectBooking={setDetailBooking} />
       )}
 
-      <button className="pb-fab" onClick={() => setModalOpen(true)}>
+      <button
+        className="pb-fab"
+        onClick={() => {
+          setEditingBooking(null);
+          setModalOpen(true);
+        }}
+      >
         <Plus size={20} />
         <span>Book pitch</span>
       </button>
@@ -731,7 +792,11 @@ export default function PitchBooker() {
           teams={teams || []}
           coaches={coaches || []}
           defaultDate={selectedDate}
-          onClose={() => setModalOpen(false)}
+          initial={editingBooking}
+          onClose={() => {
+            setModalOpen(false);
+            setEditingBooking(null);
+          }}
           onSave={handleSaveBooking}
         />
       )}
@@ -742,6 +807,11 @@ export default function PitchBooker() {
           pitch={pitches.find((p) => p.id === detailBooking.pitchId)}
           onClose={() => setDetailBooking(null)}
           onDelete={() => handleDelete(detailBooking.id)}
+          onEdit={() => {
+            setEditingBooking(detailBooking);
+            setDetailBooking(null);
+            setModalOpen(true);
+          }}
         />
       )}
 
@@ -758,7 +828,7 @@ export default function PitchBooker() {
       )}
 
       {pdfOpen && (
-        <MonthPdfModal
+        <MonthExportModal
           defaultMonth={selectedDate.slice(0, 7)}
           pitches={pitches}
           bookings={visibleBookings}
@@ -907,18 +977,22 @@ function WeekAgenda({ weekDays, pitches, bookings, onSelectBooking }) {
 
 // ---------- Month PDF modal ----------
 
-function MonthPdfModal({ defaultMonth, pitches, bookings, onClose }) {
+function MonthExportModal({ defaultMonth, pitches, bookings, onClose }) {
   const [month, setMonth] = useState(defaultMonth);
 
-  function download() {
+  function downloadPdf() {
     buildMonthPdf(month, "Drogheda Town FC", pitches, bookings);
+  }
+
+  function downloadExcel() {
+    buildMonthExcel(month, "Drogheda Town FC", pitches, bookings);
   }
 
   return (
     <div className="pb-overlay" onClick={onClose}>
       <div className="pb-modal" onClick={(e) => e.stopPropagation()}>
         <div className="pb-modal-head">
-          <h2>Download month PDF</h2>
+          <h2>Export bookings</h2>
           <button className="pb-icon-btn" onClick={onClose}>
             <X size={18} />
           </button>
@@ -929,11 +1003,15 @@ function MonthPdfModal({ defaultMonth, pitches, bookings, onClose }) {
             <input type="month" value={month} onChange={(e) => setMonth(e.target.value)} />
           </label>
           <p className="pb-repeat-hint">
-            Creates a printable PDF listing every booking that month, grouped by date, across all pitches.
+            Both list every booking that month, grouped by date, across all pitches.
           </p>
-          <button className="pb-btn-primary pb-submit" onClick={download}>
+          <button className="pb-btn-primary pb-submit" onClick={downloadPdf}>
             <Download size={16} style={{ marginRight: 6, verticalAlign: "-2px" }} />
             Download PDF
+          </button>
+          <button className="pb-btn-ghost pb-submit" onClick={downloadExcel}>
+            <FileSpreadsheet size={16} />
+            Download Excel
           </button>
         </div>
       </div>
@@ -943,14 +1021,15 @@ function MonthPdfModal({ defaultMonth, pitches, bookings, onClose }) {
 
 // ---------- Booking modal ----------
 
-function BookingModal({ pitches, teams, coaches, defaultDate, onClose, onSave }) {
-  const [pitchId, setPitchId] = useState(pitches[0]?.id || "");
-  const [date, setDate] = useState(defaultDate);
-  const [start, setStart] = useState("18:00");
-  const [end, setEnd] = useState("19:00");
-  const [coach, setCoach] = useState(coaches[0]?.name || "");
-  const [team, setTeam] = useState(teams[0]?.name || "");
-  const [notes, setNotes] = useState("");
+function BookingModal({ pitches, teams, coaches, defaultDate, initial, onClose, onSave }) {
+  const isEdit = Boolean(initial);
+  const [pitchId, setPitchId] = useState(initial?.pitchId || pitches[0]?.id || "");
+  const [date, setDate] = useState(initial?.date || defaultDate);
+  const [start, setStart] = useState(initial?.start || "18:00");
+  const [end, setEnd] = useState(initial?.end || "19:00");
+  const [coach, setCoach] = useState(initial?.coach || coaches[0]?.name || "");
+  const [team, setTeam] = useState(initial?.team || teams[0]?.name || "");
+  const [notes, setNotes] = useState(initial?.notes || "");
   const [repeatWeeks, setRepeatWeeks] = useState(1);
   const [conflict, setConflict] = useState(null);
   const [seriesResult, setSeriesResult] = useState(null);
@@ -975,7 +1054,7 @@ function BookingModal({ pitches, teams, coaches, defaultDate, onClose, onSave })
         notes: notes.trim(),
         repeatWeeks,
       },
-      null
+      initial?.id || null
     );
     setSaving(false);
     if (result.error) {
@@ -991,7 +1070,7 @@ function BookingModal({ pitches, teams, coaches, defaultDate, onClose, onSave })
     <div className="pb-overlay" onClick={onClose}>
       <div className="pb-modal" onClick={(e) => e.stopPropagation()}>
         <div className="pb-modal-head">
-          <h2>Book a pitch</h2>
+          <h2>{isEdit ? "Edit booking" : "Book a pitch"}</h2>
           <button className="pb-icon-btn" onClick={onClose}>
             <X size={18} />
           </button>
@@ -1090,18 +1169,20 @@ function BookingModal({ pitches, teams, coaches, defaultDate, onClose, onSave })
                 </select>
               )}
             </label>
-            <label>
-              Repeat weekly
-              <select value={repeatWeeks} onChange={(e) => setRepeatWeeks(Number(e.target.value))}>
-                <option value={1}>Just this week</option>
-                {REPEAT_OPTIONS.filter((n) => n > 1).map((n) => (
-                  <option key={n} value={n}>
-                    {n} weeks (same day &amp; time)
-                  </option>
-                ))}
-              </select>
-            </label>
-            {repeatWeeks > 1 && (
+            {!isEdit && (
+              <label>
+                Repeat weekly
+                <select value={repeatWeeks} onChange={(e) => setRepeatWeeks(Number(e.target.value))}>
+                  <option value={1}>Just this week</option>
+                  {REPEAT_OPTIONS.filter((n) => n > 1).map((n) => (
+                    <option key={n} value={n}>
+                      {n} weeks (same day &amp; time)
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {!isEdit && repeatWeeks > 1 && (
               <p className="pb-repeat-hint">
                 Books every {new Date(date + "T00:00:00").toLocaleDateString(undefined, { weekday: "long" })} for{" "}
                 {repeatWeeks} weeks from {new Date(date + "T00:00:00").toLocaleDateString(undefined, {
@@ -1130,7 +1211,13 @@ function BookingModal({ pitches, teams, coaches, defaultDate, onClose, onSave })
             )}
 
             <button type="submit" className="pb-btn-primary pb-submit" disabled={saving}>
-              {saving ? "Saving…" : repeatWeeks > 1 ? `Confirm ${repeatWeeks} bookings` : "Confirm booking"}
+              {saving
+                ? "Saving…"
+                : isEdit
+                ? "Save change (needs re-approval)"
+                : repeatWeeks > 1
+                ? `Confirm ${repeatWeeks} bookings`
+                : "Confirm booking"}
             </button>
           </form>
         )}
@@ -1141,7 +1228,7 @@ function BookingModal({ pitches, teams, coaches, defaultDate, onClose, onSave })
 
 // ---------- Detail modal ----------
 
-function DetailModal({ booking, pitch, onClose, onDelete }) {
+function DetailModal({ booking, pitch, onClose, onDelete, onEdit }) {
   const [confirming, setConfirming] = useState(false);
   return (
     <div className="pb-overlay" onClick={onClose}>
@@ -1188,9 +1275,14 @@ function DetailModal({ booking, pitch, onClose, onDelete }) {
           )}
         </div>
         {!confirming ? (
-          <button className="pb-btn-danger" onClick={() => setConfirming(true)}>
-            <Trash2 size={16} /> Cancel booking
-          </button>
+          <div className="pb-detail-actions">
+            <button className="pb-btn-ghost pb-detail-edit" onClick={onEdit}>
+              <Pencil size={15} /> Edit / move
+            </button>
+            <button className="pb-btn-danger" onClick={() => setConfirming(true)}>
+              <Trash2 size={16} /> Cancel booking
+            </button>
+          </div>
         ) : (
           <div className="pb-confirm-row">
             <span>Cancel this booking?</span>
@@ -1579,6 +1671,12 @@ const css = `
   opacity: 0.75;
 }
 .pb-crest { flex-shrink: 0; }
+.pb-crest-img {
+  width: 42px;
+  height: 42px;
+  object-fit: contain;
+  display: block;
+}
 
 .pb-icon-btn {
   background: rgba(255,255,255,0.08);
@@ -2107,6 +2205,13 @@ const css = `
   width: 100%;
   margin-top: 10px;
 }
+.pb-detail-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.pb-detail-actions .pb-btn-danger { margin-top: 0; flex: 1; }
+.pb-detail-edit { flex: 1; justify-content: center; }
 .pb-btn-ghost {
   background: transparent;
   border: 1px solid var(--pitch-line);
