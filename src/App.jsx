@@ -215,7 +215,84 @@ function buildMonthExcel(monthValue, clubName, pitches, bookings) {
   XLSX.writeFile(wb, `pitch-bookings-${monthValue}.xlsx`);
 }
 
+// ---------- Approval result screen (landed on from an email link) ----------
+
+function ApprovalResultScreen({ params }) {
+  const configs = {
+    approved: { title: "Booking approved ✅", tone: "good", body: params.detail },
+    rejected: { title: "Booking rejected", tone: "warn", body: params.detail },
+    clash: {
+      title: "Clashes with an approved booking",
+      tone: "warn",
+      body: (
+        <>
+          <p>{params.detail}</p>
+          <p>
+            This would clash with <strong>{params.clashDetail}</strong>, already approved on the same pitch.
+          </p>
+          <p>Open the app's Approvals screen to review and decide — this link won't auto-approve over a clash.</p>
+        </>
+      ),
+    },
+    already: {
+      title: "Already actioned",
+      tone: "warn",
+      body: (
+        <>
+          <p>
+            This request was already <strong>{params.status}</strong>.
+          </p>
+          <p>{params.detail}</p>
+        </>
+      ),
+    },
+    notfound: { title: "Not found", tone: "bad", body: "This booking no longer exists." },
+    invalid: { title: "Invalid link", tone: "bad", body: "This link isn't valid for this booking." },
+    badlink: { title: "Bad link", tone: "bad", body: "This link is missing information and can't be used." },
+  };
+  const cfg = configs[params.approval] || {
+    title: "Done",
+    tone: "good",
+    body: "Action completed.",
+  };
+  const color = cfg.tone === "good" ? "#1B4332" : cfg.tone === "warn" ? "#8A5A00" : "#A3401F";
+
+  return (
+    <div style={{ minHeight: "100vh" }} className="pb-root">
+      <style>{css}</style>
+      <div className="pb-result-wrap">
+        <div className="pb-result-card">
+          <div className="pb-result-head" style={{ background: color }}>
+            <img src="/crest.png" alt="" className="pb-crest-img" />
+            <strong>Pitch Book</strong>
+          </div>
+          <div className="pb-result-body">
+            <h1 style={{ color }}>{cfg.title}</h1>
+            {typeof cfg.body === "string" ? <p>{cfg.body}</p> : cfg.body}
+            <a className="pb-btn-primary pb-result-link" href={window.location.pathname}>
+              Open Pitch Book
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function PitchBooker() {
+  // If we've just been redirected here from an email Approve/Reject link,
+  // show a small result screen instead of the main calendar. This is
+  // computed once from the URL, not app state, so it's safe to check
+  // before any hooks run.
+  const approvalParams = (() => {
+    if (typeof window === "undefined") return null;
+    const params = new URLSearchParams(window.location.search);
+    return params.get("approval") ? Object.fromEntries(params.entries()) : null;
+  })();
+  if (approvalParams) {
+    return <ApprovalResultScreen params={approvalParams} />;
+  }
+
   const [pitches, setPitches] = useState(null);
   const [teams, setTeams] = useState(null);
   const [coaches, setCoaches] = useState(null);
@@ -2336,5 +2413,48 @@ const css = `
   border: 1px solid var(--pitch-line);
   font-size: 14px;
   min-width: 0;
+}
+
+.pb-result-wrap {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+}
+.pb-result-card {
+  max-width: 420px;
+  width: 100%;
+  background: var(--card-bg);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.12);
+}
+.pb-result-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 20px;
+  color: #fff;
+}
+.pb-result-head .pb-crest-img { width: 30px; height: 30px; }
+.pb-result-head strong {
+  font-family: 'Oswald', sans-serif;
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+.pb-result-body { padding: 24px 22px; }
+.pb-result-body h1 {
+  font-family: 'Oswald', sans-serif;
+  font-size: 20px;
+  margin: 0 0 12px;
+}
+.pb-result-body p { font-size: 14.5px; line-height: 1.5; color: var(--charcoal); }
+.pb-result-link {
+  display: inline-block;
+  text-decoration: none;
+  margin-top: 12px;
+  text-align: center;
 }
 `;
