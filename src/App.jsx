@@ -89,6 +89,13 @@ function overlaps(aStart, aEnd, bStart, bEnd) {
   return aStart < bEnd && bStart < aEnd;
 }
 
+function sectionsConflict(a, b) {
+  if (a === "full" || b === "full" || !a || !b) return true;
+  return a === b;
+}
+
+const SECTION_LABELS = { full: "Full pitch", half_1: "Half 1", half_2: "Half 2" };
+
 // ---------- month PDF export ----------
 
 function buildMonthPdf(monthValue, clubName, pitches, bookings) {
@@ -158,8 +165,16 @@ function buildMonthPdf(monthValue, clubName, pitches, bookings) {
       doc.setFontSize(10.5);
       const time = `${minutesToLabel(timeToMinutes(b.start))}\u2013${minutesToLabel(timeToMinutes(b.end))}`;
       doc.text(time, marginX + 10, y);
-      doc.text(pitchName(b.pitchId), marginX + 90, y);
-      const teamLabel = b.status === "pending" ? `${b.team} (${b.coach}) — PENDING` : `${b.team} (${b.coach})`;
+      const pitchLabel =
+        b.section && b.section !== "full"
+          ? `${pitchName(b.pitchId)} (${b.section === "half_1" ? "Half 1" : "Half 2"})`
+          : pitchName(b.pitchId);
+      doc.text(pitchLabel, marginX + 90, y);
+      const typeTag = b.sessionType === "match" ? "Match" : "Training";
+      const teamLabel =
+        b.status === "pending"
+          ? `${b.team} (${b.coach}) — ${typeTag} — PENDING`
+          : `${b.team} (${b.coach}) — ${typeTag}`;
       doc.text(teamLabel, marginX + 230, y);
       y += 15;
     }
@@ -185,7 +200,7 @@ function buildMonthExcel(monthValue, clubName, pitches, bookings) {
   const pitchName = (id) => pitches.find((p) => p.id === id)?.name || "Pitch";
   const monthLabel = new Date(year, monthIndex, 1).toLocaleDateString(undefined, { month: "long", year: "numeric" });
 
-  const header = ["Date", "Day", "Start", "End", "Pitch", "Team / Session", "Coach", "Status", "Notes"];
+  const header = ["Date", "Day", "Start", "End", "Pitch", "Section", "Type", "Team / Session", "Coach", "Status", "Notes"];
   const rows = monthBookings.map((b) => {
     const d = new Date(b.date + "T00:00:00");
     return [
@@ -194,6 +209,8 @@ function buildMonthExcel(monthValue, clubName, pitches, bookings) {
       minutesToLabel(timeToMinutes(b.start)),
       minutesToLabel(timeToMinutes(b.end)),
       pitchName(b.pitchId),
+      SECTION_LABELS[b.section] || "Full pitch",
+      b.sessionType === "match" ? "Match" : "Training",
       b.team,
       b.coach,
       b.status === "pending" ? "Pending" : "Approved",
@@ -206,7 +223,7 @@ function buildMonthExcel(monthValue, clubName, pitches, bookings) {
 
   ws["!cols"] = [
     { wch: 12 }, { wch: 11 }, { wch: 8 }, { wch: 8 },
-    { wch: 16 }, { wch: 24 }, { wch: 16 }, { wch: 10 }, { wch: 28 },
+    { wch: 16 }, { wch: 10 }, { wch: 10 }, { wch: 24 }, { wch: 16 }, { wch: 10 }, { wch: 28 },
   ];
   ws["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: header.length - 1 } }];
 
@@ -308,6 +325,7 @@ export default function PitchBooker() {
   const [pdfOpen, setPdfOpen] = useState(false);
   const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [adminPasscode, setAdminPasscode] = useState(null); // held in memory only, never persisted
+  const [managePasscode, setManagePasscode] = useState(null); // separate passcode, just for Pitches/Coaches
   const [viewMode, setViewMode] = useState("day"); // "day" | "week"
   const [detailBooking, setDetailBooking] = useState(null);
   const [editingBooking, setEditingBooking] = useState(null);
@@ -325,6 +343,8 @@ export default function PitchBooker() {
       team: row.team,
       notes: row.notes || "",
       status: row.status || "approved",
+      sessionType: row.session_type || "match",
+      section: row.section || "full",
       createdAt: row.created_at,
     };
   }
@@ -462,32 +482,27 @@ export default function PitchBooker() {
   }, []);
 
   // Diff the edited pitch list against what's stored and push only the changes.
-  const savePitches = useCallback(
-    async (next) => {
-      const previous = pitches || [];
+  const savePitches = useCallback(async (next, passcode) => {
+    if (!supabaseConfigured) {
       setPitches(next);
-      if (!supabaseConfigured) return;
-      try {
-        const prevIds = new Set(previous.map((p) => p.id));
-        const nextIds = new Set(next.map((p) => p.id));
-        const removed = previous.filter((p) => !nextIds.has(p.id));
-        const upserts = next.map((p, i) => ({ id: p.id, name: p.name, sort_order: i }));
-
-        if (upserts.length) {
-          const { error: err } = await supabase.from("pitches").upsert(upserts);
-          if (err) throw err;
-        }
-        for (const p of removed) {
-          const { error: err } = await supabase.from("pitches").delete().eq("id", p.id);
-          if (err) throw err;
-        }
-      } catch (e) {
-        console.error(e);
-        setError("Couldn't save pitch changes.");
-      }
-    },
-    [pitches]
-  );
+      return true;
+    }
+    try {
+      const upserts = next.map((p, i) => ({ id: p.id, name: p.name, sort_order: i }));
+      const { data, error: err } = await supabase.rpc("admin_save_pitches", {
+        new_pitches: upserts,
+        input_passcode: passcode,
+      });
+      if (err) throw err;
+      if (!data) return false;
+      setPitches(await fetchPitches());
+      return true;
+    } catch (e) {
+      console.error(e);
+      setError("Couldn't save pitch changes.");
+      return false;
+    }
+  }, [fetchPitches]);
 
   const saveTeams = useCallback(
     async (next) => {
@@ -514,30 +529,39 @@ export default function PitchBooker() {
     [teams]
   );
 
-  const saveCoaches = useCallback(
-    async (next) => {
-      const previous = coaches || [];
+  const saveCoaches = useCallback(async (next, passcode) => {
+    if (!supabaseConfigured) {
       setCoaches(next);
-      if (!supabaseConfigured) return;
-      try {
-        const nextIds = new Set(next.map((c) => c.id));
-        const removed = previous.filter((c) => !nextIds.has(c.id));
-        const upserts = next.map((c, i) => ({ id: c.id, name: c.name, email: c.email || "", sort_order: i }));
-        if (upserts.length) {
-          const { error: err } = await supabase.from("coaches").upsert(upserts);
-          if (err) throw err;
-        }
-        for (const c of removed) {
-          const { error: err } = await supabase.from("coaches").delete().eq("id", c.id);
-          if (err) throw err;
-        }
-      } catch (e) {
-        console.error(e);
-        setError("Couldn't save coach changes. Have you run migration_teams_coaches.sql yet?");
-      }
-    },
-    [coaches]
-  );
+      return true;
+    }
+    try {
+      const upserts = next.map((c, i) => ({ id: c.id, name: c.name, sort_order: i }));
+      const { data, error: err } = await supabase.rpc("admin_save_coaches", {
+        new_coaches: upserts,
+        input_passcode: passcode,
+      });
+      if (err) throw err;
+      if (!data) return false;
+      setCoaches(await fetchCoaches());
+      return true;
+    } catch (e) {
+      console.error(e);
+      setError("Couldn't save coach changes.");
+      return false;
+    }
+  }, [fetchCoaches]);
+
+  async function verifyManagePasscode(passcode) {
+    if (!supabaseConfigured) return false;
+    try {
+      const { data, error: err } = await supabase.rpc("verify_manage_passcode", { input_passcode: passcode });
+      if (err) throw err;
+      return Boolean(data);
+    } catch (e) {
+      console.error(e);
+      return false;
+    }
+  }
 
   const weekDays = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)), [weekStart]);
 
@@ -560,12 +584,13 @@ export default function PitchBooker() {
 
   const isToday = selectedDate === toISODate(new Date());
 
-  function findConflict(list, pitchId, date, start, end, excludeId) {
+  function findConflict(list, pitchId, date, start, end, excludeId, section) {
     return (list || []).find(
       (b) =>
         b.id !== excludeId &&
         b.pitchId === pitchId &&
         b.date === date &&
+        sectionsConflict(section, b.section) &&
         overlaps(timeToMinutes(start), timeToMinutes(end), timeToMinutes(b.start), timeToMinutes(b.end))
     );
   }
@@ -592,7 +617,7 @@ export default function PitchBooker() {
       const live = data.map(rowToBooking).filter((b) => b.status !== "rejected" && b.status !== "cancelled");
 
       if (dates.length === 1) {
-        const liveConflict = findConflict(live, form.pitchId, form.date, form.start, form.end, editingId);
+        const liveConflict = findConflict(live, form.pitchId, form.date, form.start, form.end, editingId, form.section);
         if (liveConflict) {
           return { error: liveConflict };
         }
@@ -605,6 +630,8 @@ export default function PitchBooker() {
           coach: form.coach,
           team: form.team,
           notes: form.notes || "",
+          session_type: form.sessionType,
+          section: form.section,
         };
 
         if (editingId) {
@@ -631,7 +658,7 @@ export default function PitchBooker() {
       const skipped = [];
       const toInsert = [];
       for (const d of dates) {
-        const clash = findConflict(live, form.pitchId, d, form.start, form.end, null);
+        const clash = findConflict(live, form.pitchId, d, form.start, form.end, null, form.section);
         if (clash) {
           skipped.push({ date: d, conflict: clash });
         } else {
@@ -645,6 +672,8 @@ export default function PitchBooker() {
             team: form.team,
             notes: form.notes || "",
             status: "pending",
+            session_type: form.sessionType,
+            section: form.section,
           });
         }
       }
@@ -901,6 +930,12 @@ export default function PitchBooker() {
           onSavePitches={savePitches}
           onSaveTeams={saveTeams}
           onSaveCoaches={saveCoaches}
+          managePasscode={managePasscode}
+          onUnlockManage={async (code) => {
+            const ok = await verifyManagePasscode(code);
+            if (ok) setManagePasscode(code);
+            return ok;
+          }}
         />
       )}
 
@@ -985,7 +1020,10 @@ function ScheduleGrid({ pitches, dayBookings, isToday, now, onSelectBooking }) {
                           {minutesToLabel(timeToMinutes(b.start))}–{minutesToLabel(timeToMinutes(b.end))}
                           {pending && <span className="pb-pending-tag">PENDING</span>}
                         </span>
-                        <span className="pb-block-team">{b.team}</span>
+                        <span className="pb-block-team">
+                          {b.team}
+                          {b.section && b.section !== "full" ? ` (${SECTION_LABELS[b.section]})` : ""}
+                        </span>
                         <span className="pb-block-coach">{b.coach}</span>
                       </button>
                     );
@@ -1038,7 +1076,10 @@ function WeekAgenda({ weekDays, pitches, bookings, onSelectBooking }) {
                           {b.status === "pending" && <span className="pb-pending-tag">PENDING</span>}
                         </span>
                         <span className="pb-week-pitch">{pitches.find((p) => p.id === b.pitchId)?.name}</span>
-                        <span className="pb-week-team">{b.team}</span>
+                        <span className="pb-week-team">
+                          {b.team}
+                          {b.section && b.section !== "full" ? ` (${SECTION_LABELS[b.section]})` : ""}
+                        </span>
                       </button>
                     </li>
                   );
@@ -1107,12 +1148,19 @@ function BookingModal({ pitches, teams, coaches, defaultDate, initial, onClose, 
   const [coach, setCoach] = useState(initial?.coach || coaches[0]?.name || "");
   const [team, setTeam] = useState(initial?.team || teams[0]?.name || "");
   const [notes, setNotes] = useState(initial?.notes || "");
+  const [sessionType, setSessionType] = useState(initial?.sessionType || "training");
+  const [section, setSection] = useState(initial?.section || "full");
   const [repeatWeeks, setRepeatWeeks] = useState(1);
   const [conflict, setConflict] = useState(null);
   const [seriesResult, setSeriesResult] = useState(null);
   const [saving, setSaving] = useState(false);
 
   const invalidTime = timeToMinutes(end) <= timeToMinutes(start);
+
+  function handleSessionTypeChange(next) {
+    setSessionType(next);
+    if (next === "match") setSection("full");
+  }
 
   async function submit(e) {
     e.preventDefault();
@@ -1130,6 +1178,8 @@ function BookingModal({ pitches, teams, coaches, defaultDate, initial, onClose, 
         team: team.trim(),
         notes: notes.trim(),
         repeatWeeks,
+        sessionType,
+        section,
       },
       initial?.id || null
     );
@@ -1199,6 +1249,31 @@ function BookingModal({ pitches, teams, coaches, defaultDate, initial, onClose, 
                 ))}
               </select>
             </label>
+            <div className="pb-form-row">
+              <label>
+                Type
+                <select value={sessionType} onChange={(e) => handleSessionTypeChange(e.target.value)}>
+                  <option value="training">Training</option>
+                  <option value="match">Match</option>
+                </select>
+              </label>
+              {sessionType === "training" && (
+                <label>
+                  Pitch section
+                  <select value={section} onChange={(e) => setSection(e.target.value)}>
+                    <option value="full">Full pitch</option>
+                    <option value="half_1">Half 1</option>
+                    <option value="half_2">Half 2</option>
+                  </select>
+                </label>
+              )}
+            </div>
+            {sessionType === "training" && section !== "full" && (
+              <p className="pb-repeat-hint">
+                Booking {SECTION_LABELS[section]} only — the other half stays free for someone else to book at the
+                same time.
+              </p>
+            )}
             <label>
               Date
               <input type="date" value={date} onChange={(e) => setDate(e.target.value)} required />
@@ -1335,6 +1410,13 @@ function DetailModal({ booking, pitch, onClose, onDelete, onEdit }) {
             </span>
           </div>
           <div className="pb-detail-row">
+            <span className="pb-detail-label">Type</span>
+            <span>
+              {booking.sessionType === "match" ? "Match" : "Training"}
+              {booking.section && booking.section !== "full" ? ` — ${SECTION_LABELS[booking.section]}` : ""}
+            </span>
+          </div>
+          <div className="pb-detail-row">
             <span className="pb-detail-label">Team / session</span>
             <span>{booking.team}</span>
           </div>
@@ -1405,6 +1487,7 @@ function ApprovalsModal({ pendingBookings, allBookings, pitches, adminPasscode, 
         b.status === "approved" &&
         b.pitchId === booking.pitchId &&
         b.date === booking.date &&
+        sectionsConflict(booking.section, b.section) &&
         overlaps(timeToMinutes(booking.start), timeToMinutes(booking.end), timeToMinutes(b.start), timeToMinutes(b.end))
     );
   }
@@ -1476,7 +1559,11 @@ function ApprovalsModal({ pendingBookings, allBookings, pitches, adminPasscode, 
                       , {minutesToLabel(timeToMinutes(b.start))}–{minutesToLabel(timeToMinutes(b.end))} ·{" "}
                       {pitchName(b.pitchId)}
                     </div>
-                    <div className="pb-approval-team">{b.team}</div>
+                    <div className="pb-approval-team">
+                      {b.team}
+                      {b.section && b.section !== "full" ? ` (${SECTION_LABELS[b.section]})` : ""}
+                    </div>
+                    <div className="pb-approval-type">{b.sessionType === "match" ? "Match" : "Training"}</div>
                     <div className="pb-approval-coach">Requested by {b.coach}</div>
                     {b.notes && <div className="pb-approval-notes">{b.notes}</div>}
                   </div>
@@ -1516,10 +1603,11 @@ function ApprovalsModal({ pendingBookings, allBookings, pitches, adminPasscode, 
 
 // ---------- Manage lists modal (Pitches / Teams / Coaches) ----------
 
-function SimpleNameListEditor({ items, onSave, label, labelPlural, placeholder }) {
+function SimpleNameListEditor({ items, onSave, passcode, label, labelPlural, placeholder }) {
   const [list, setList] = useState(items);
   const [newName, setNewName] = useState("");
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
 
   function add() {
     const name = newName.trim();
@@ -1538,8 +1626,10 @@ function SimpleNameListEditor({ items, onSave, label, labelPlural, placeholder }
 
   async function save() {
     setSaving(true);
-    await onSave(list);
+    setSaveError(false);
+    const result = await onSave(list, passcode);
     setSaving(false);
+    if (result === false) setSaveError(true);
   }
 
   return (
@@ -1566,6 +1656,7 @@ function SimpleNameListEditor({ items, onSave, label, labelPlural, placeholder }
           <Plus size={16} /> Add
         </button>
       </div>
+      {saveError && <div className="pb-inline-warning">That passcode isn't right — changes weren't saved.</div>}
       <button className="pb-btn-primary pb-submit" onClick={save} disabled={saving}>
         {saving ? "Saving…" : `Save ${labelPlural}`}
       </button>
@@ -1573,45 +1664,41 @@ function SimpleNameListEditor({ items, onSave, label, labelPlural, placeholder }
   );
 }
 
-function CoachListEditor({ items, onSave }) {
+function CoachListEditor({ items, onSave, passcode }) {
   const [list, setList] = useState(items);
   const [newName, setNewName] = useState("");
-  const [newEmail, setNewEmail] = useState("");
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
 
   function add() {
     const name = newName.trim();
     if (!name) return;
-    setList([...list, { id: genId(), name, email: newEmail.trim() }]);
+    setList([...list, { id: genId(), name }]);
     setNewName("");
-    setNewEmail("");
   }
 
   function remove(id) {
     setList(list.filter((c) => c.id !== id));
   }
 
-  function update(id, field, value) {
-    setList(list.map((c) => (c.id === id ? { ...c, [field]: value } : c)));
+  function rename(id, name) {
+    setList(list.map((c) => (c.id === id ? { ...c, name } : c)));
   }
 
   async function save() {
     setSaving(true);
-    await onSave(list);
+    setSaveError(false);
+    const result = await onSave(list, passcode);
     setSaving(false);
+    if (result === false) setSaveError(true);
   }
 
   return (
     <div>
       <div className="pb-pitch-list">
         {list.map((c) => (
-          <div key={c.id} className="pb-coach-row">
-            <input value={c.name} placeholder="Name" onChange={(e) => update(c.id, "name", e.target.value)} />
-            <input
-              value={c.email || ""}
-              placeholder="Email (optional, for later)"
-              onChange={(e) => update(c.id, "email", e.target.value)}
-            />
+          <div key={c.id} className="pb-pitch-row">
+            <input value={c.name} placeholder="Name" onChange={(e) => rename(c.id, e.target.value)} />
             <button className="pb-icon-btn" onClick={() => remove(c.id)} aria-label="Remove coach">
               <Trash2 size={16} />
             </button>
@@ -1619,18 +1706,18 @@ function CoachListEditor({ items, onSave }) {
         ))}
         {list.length === 0 && <p className="pb-manage-note">None added yet.</p>}
       </div>
-      <div className="pb-add-coach-row">
-        <input placeholder="Name" value={newName} onChange={(e) => setNewName(e.target.value)} />
+      <div className="pb-add-pitch-row">
         <input
-          placeholder="Email (optional)"
-          value={newEmail}
-          onChange={(e) => setNewEmail(e.target.value)}
+          placeholder="Coach name"
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), add())}
         />
         <button className="pb-btn-ghost" onClick={add}>
           <Plus size={16} /> Add
         </button>
       </div>
+      {saveError && <div className="pb-inline-warning">That passcode isn't right — changes weren't saved.</div>}
       <button className="pb-btn-primary pb-submit" onClick={save} disabled={saving}>
         {saving ? "Saving…" : "Save coaches"}
       </button>
@@ -1638,8 +1725,32 @@ function CoachListEditor({ items, onSave }) {
   );
 }
 
-function ManageListsModal({ pitches, teams, coaches, onClose, onSavePitches, onSaveTeams, onSaveCoaches }) {
+function ManageListsModal({
+  pitches,
+  teams,
+  coaches,
+  onClose,
+  onSavePitches,
+  onSaveTeams,
+  onSaveCoaches,
+  managePasscode,
+  onUnlockManage,
+}) {
   const [tab, setTab] = useState("pitches");
+  const [passInput, setPassInput] = useState("");
+  const [passError, setPassError] = useState(false);
+  const [checking, setChecking] = useState(false);
+
+  const needsUnlock = (tab === "pitches" || tab === "coaches") && !managePasscode;
+
+  async function submitPasscode(e) {
+    e.preventDefault();
+    setChecking(true);
+    setPassError(false);
+    const ok = await onUnlockManage(passInput);
+    setChecking(false);
+    if (!ok) setPassError(true);
+  }
 
   return (
     <div className="pb-overlay" onClick={onClose}>
@@ -1664,25 +1775,47 @@ function ManageListsModal({ pitches, teams, coaches, onClose, onSavePitches, onS
           </button>
         </div>
 
-        {tab === "pitches" && (
-          <SimpleNameListEditor
-            items={pitches}
-            onSave={onSavePitches}
-            label="pitch"
-            labelPlural="pitches"
-            placeholder="New pitch name"
-          />
+        {needsUnlock ? (
+          <form onSubmit={submitPasscode} className="pb-form">
+            <p className="pb-manage-note">
+              <Lock size={13} style={{ verticalAlign: "-2px", marginRight: 4 }} />
+              Adding or editing {tab} needs the manage passcode.
+            </p>
+            <label>
+              Passcode
+              <input type="password" value={passInput} onChange={(e) => setPassInput(e.target.value)} autoFocus />
+            </label>
+            {passError && <div className="pb-inline-warning">That passcode isn't right.</div>}
+            <button type="submit" className="pb-btn-primary pb-submit" disabled={checking}>
+              {checking ? "Checking…" : "Unlock"}
+            </button>
+          </form>
+        ) : (
+          <>
+            {tab === "pitches" && (
+              <SimpleNameListEditor
+                items={pitches}
+                onSave={onSavePitches}
+                passcode={managePasscode}
+                label="pitch"
+                labelPlural="pitches"
+                placeholder="New pitch name"
+              />
+            )}
+            {tab === "teams" && (
+              <SimpleNameListEditor
+                items={teams}
+                onSave={onSaveTeams}
+                label="team"
+                labelPlural="teams"
+                placeholder="New team / session name"
+              />
+            )}
+            {tab === "coaches" && (
+              <CoachListEditor items={coaches} onSave={onSaveCoaches} passcode={managePasscode} />
+            )}
+          </>
         )}
-        {tab === "teams" && (
-          <SimpleNameListEditor
-            items={teams}
-            onSave={onSaveTeams}
-            label="team"
-            labelPlural="teams"
-            placeholder="New team / session name"
-          />
-        )}
-        {tab === "coaches" && <CoachListEditor items={coaches} onSave={onSaveCoaches} />}
       </div>
     </div>
   );
@@ -2366,6 +2499,7 @@ const css = `
   color: var(--pitch-mid);
 }
 .pb-approval-team { font-size: 14px; font-weight: 600; }
+.pb-approval-type { font-size: 11.5px; color: #8A5A00; text-transform: uppercase; letter-spacing: 0.3px; font-weight: 600; }
 .pb-approval-coach { font-size: 12.5px; color: #6B5B5B; }
 .pb-approval-notes { font-size: 12px; color: #7C6B6B; font-style: italic; }
 .pb-approval-actions { display: flex; gap: 8px; margin-top: 2px; }
