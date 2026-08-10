@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   Plus,
   X,
@@ -23,8 +23,9 @@ import { supabase, supabaseConfigured } from "./supabaseClient";
 
 // ---------- constants ----------
 
-const DAY_START = 17;  // 17:00 (5pm)
+const DAY_START = 8;   // 08:00 (grid start - scrollable up to here)
 const DAY_END = 22;    // 22:00
+const DEFAULT_SCROLL_HOUR = 16; // 4pm - where the day view opens by default
 const SLOT_MIN = 30;   // grid resolution in minutes
 const PITCH_COLORS = ["#C8102E", "#1C1C1C", "#8C1D25", "#4A4A4A", "#A11D2E", "#2B2B2B"];
 const REPEAT_OPTIONS = [1, 2, 3, 4, 5, 6, 8, 10, 12];
@@ -880,6 +881,7 @@ export default function PitchBooker() {
           dayBookings={dayBookings}
           isToday={isToday}
           now={now}
+          selectedDate={selectedDate}
           onSelectBooking={setDetailBooking}
         />
       ) : (
@@ -975,7 +977,8 @@ export default function PitchBooker() {
 
 // ---------- Schedule grid ----------
 
-function ScheduleGrid({ pitches, dayBookings, isToday, now, onSelectBooking }) {
+function ScheduleGrid({ pitches, dayBookings, isToday, now, selectedDate, onSelectBooking }) {
+  const scrollRef = useRef(null);
   const totalMinutes = (DAY_END - DAY_START) * 60;
   const hourMarks = [];
   for (let h = DAY_START; h <= DAY_END; h++) hourMarks.push(h * 60);
@@ -986,8 +989,14 @@ function ScheduleGrid({ pitches, dayBookings, isToday, now, onSelectBooking }) {
   const pxPerMin = 1.6; // vertical scale
   const gridHeight = totalMinutes * pxPerMin;
 
+  useEffect(() => {
+    if (!scrollRef.current) return;
+    const target = (DEFAULT_SCROLL_HOUR * 60 - DAY_START * 60) * pxPerMin;
+    scrollRef.current.scrollTop = Math.max(target, 0);
+  }, [selectedDate]);
+
   return (
-    <div className="pb-grid-wrap">
+    <div className="pb-grid-wrap" ref={scrollRef}>
       <div className="pb-grid" style={{ height: gridHeight + 8 }}>
         <div className="pb-time-col">
           {hourMarks.map((m) => (
@@ -2224,6 +2233,10 @@ const css = `
 .pb-grid-wrap {
   position: relative;
   padding: 8px 12px 24px;
+  max-height: calc(100vh - 260px);
+  min-height: 360px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .pb-grid {
