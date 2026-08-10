@@ -352,7 +352,7 @@ export default function PitchBooker() {
   const fetchPitches = useCallback(async () => {
     const { data, error: err } = await supabase.from("pitches").select("*").order("sort_order", { ascending: true });
     if (err) throw err;
-    return (data || []).map((r) => ({ id: r.id, name: r.name }));
+    return (data || []).map((r) => ({ id: r.id, name: r.name, allowHalves: Boolean(r.allow_halves) }));
   }, []);
 
   // Teams and coaches are optional add-on tables (see migration_teams_coaches.sql).
@@ -488,7 +488,12 @@ export default function PitchBooker() {
       return true;
     }
     try {
-      const upserts = next.map((p, i) => ({ id: p.id, name: p.name, sort_order: i }));
+      const upserts = next.map((p, i) => ({
+        id: p.id,
+        name: p.name,
+        sort_order: i,
+        allow_halves: Boolean(p.allowHalves),
+      }));
       const { data, error: err } = await supabase.rpc("admin_save_pitches", {
         new_pitches: upserts,
         input_passcode: passcode,
@@ -1241,7 +1246,15 @@ function BookingModal({ pitches, teams, coaches, defaultDate, initial, onClose, 
           <form onSubmit={submit} className="pb-form">
             <label>
               Pitch
-              <select value={pitchId} onChange={(e) => setPitchId(e.target.value)}>
+              <select
+                value={pitchId}
+                onChange={(e) => {
+                  const nextId = e.target.value;
+                  setPitchId(nextId);
+                  const nextPitch = pitches.find((p) => p.id === nextId);
+                  if (!nextPitch?.allowHalves) setSection("full");
+                }}
+              >
                 {pitches.map((p) => (
                   <option key={p.id} value={p.id}>
                     {p.name}
@@ -1257,7 +1270,7 @@ function BookingModal({ pitches, teams, coaches, defaultDate, initial, onClose, 
                   <option value="match">Match</option>
                 </select>
               </label>
-              {sessionType === "training" && (
+              {sessionType === "training" && pitches.find((p) => p.id === pitchId)?.allowHalves && (
                 <label>
                   Pitch section
                   <select value={section} onChange={(e) => setSection(e.target.value)}>
@@ -1603,6 +1616,77 @@ function ApprovalsModal({ pendingBookings, allBookings, pitches, adminPasscode, 
 
 // ---------- Manage lists modal (Pitches / Teams / Coaches) ----------
 
+function PitchListEditor({ items, onSave, passcode }) {
+  const [list, setList] = useState(items);
+  const [newName, setNewName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+
+  function add() {
+    const name = newName.trim();
+    if (!name) return;
+    setList([...list, { id: genId(), name, allowHalves: false }]);
+    setNewName("");
+  }
+
+  function remove(id) {
+    setList(list.filter((p) => p.id !== id));
+  }
+
+  function rename(id, name) {
+    setList(list.map((p) => (p.id === id ? { ...p, name } : p)));
+  }
+
+  function toggleHalves(id) {
+    setList(list.map((p) => (p.id === id ? { ...p, allowHalves: !p.allowHalves } : p)));
+  }
+
+  async function save() {
+    setSaving(true);
+    setSaveError(false);
+    const result = await onSave(list, passcode);
+    setSaving(false);
+    if (result === false) setSaveError(true);
+  }
+
+  return (
+    <div>
+      <div className="pb-pitch-list">
+        {list.map((p) => (
+          <div key={p.id} className="pb-pitch-editor-row">
+            <div className="pb-pitch-row">
+              <input value={p.name} onChange={(e) => rename(p.id, e.target.value)} />
+              <button className="pb-icon-btn" onClick={() => remove(p.id)} aria-label="Remove pitch">
+                <Trash2 size={16} />
+              </button>
+            </div>
+            <label className="pb-halves-toggle">
+              <input type="checkbox" checked={Boolean(p.allowHalves)} onChange={() => toggleHalves(p.id)} />
+              Allow half-pitch bookings for training
+            </label>
+          </div>
+        ))}
+        {list.length === 0 && <p className="pb-manage-note">None added yet.</p>}
+      </div>
+      <div className="pb-add-pitch-row">
+        <input
+          placeholder="New pitch name"
+          value={newName}
+          onChange={(e) => setNewName(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && (e.preventDefault(), add())}
+        />
+        <button className="pb-btn-ghost" onClick={add}>
+          <Plus size={16} /> Add
+        </button>
+      </div>
+      {saveError && <div className="pb-inline-warning">That passcode isn't right — changes weren't saved.</div>}
+      <button className="pb-btn-primary pb-submit" onClick={save} disabled={saving}>
+        {saving ? "Saving…" : "Save pitches"}
+      </button>
+    </div>
+  );
+}
+
 function SimpleNameListEditor({ items, onSave, passcode, label, labelPlural, placeholder }) {
   const [list, setList] = useState(items);
   const [newName, setNewName] = useState("");
@@ -1793,14 +1877,7 @@ function ManageListsModal({
         ) : (
           <>
             {tab === "pitches" && (
-              <SimpleNameListEditor
-                items={pitches}
-                onSave={onSavePitches}
-                passcode={managePasscode}
-                label="pitch"
-                labelPlural="pitches"
-                placeholder="New pitch name"
-              />
+              <PitchListEditor items={pitches} onSave={onSavePitches} passcode={managePasscode} />
             )}
             {tab === "teams" && (
               <SimpleNameListEditor
@@ -2514,6 +2591,27 @@ const css = `
   border-radius: 8px;
   border: 1px solid var(--pitch-line);
   font-size: 14px;
+}
+.pb-pitch-editor-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--pitch-line);
+}
+.pb-pitch-editor-row:last-child { border-bottom: none; padding-bottom: 0; }
+.pb-halves-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: #5A4A4A;
+  padding-left: 2px;
+}
+.pb-halves-toggle input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--pitch-mid);
 }
 .pb-add-pitch-row { display: flex; gap: 8px; margin-bottom: 14px; }
 .pb-add-pitch-row input {
