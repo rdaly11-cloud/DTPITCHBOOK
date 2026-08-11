@@ -297,11 +297,14 @@ function ApprovalResultScreen({ params }) {
   );
 }
 
+const ACCESS_UNLOCKED_KEY = "pb_access_unlocked";
+
 export default function PitchBooker() {
   // If we've just been redirected here from an email Approve/Reject link,
-  // show a small result screen instead of the main calendar. This is
-  // computed once from the URL, not app state, so it's safe to check
-  // before any hooks run.
+  // show a small result screen instead of the main calendar - this bypasses
+  // the PIN gate on purpose, so approving from an email stays one-click.
+  // Computed once from the URL, not app state, so it's safe to check before
+  // any hooks run.
   const approvalParams = (() => {
     if (typeof window === "undefined") return null;
     const params = new URLSearchParams(window.location.search);
@@ -311,6 +314,101 @@ export default function PitchBooker() {
     return <ApprovalResultScreen params={approvalParams} />;
   }
 
+  return <PitchBookerGate />;
+}
+
+function PitchBookerGate() {
+  const [unlocked, setUnlocked] = useState(() => {
+    if (typeof window === "undefined") return false;
+    try {
+      return window.localStorage.getItem(ACCESS_UNLOCKED_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
+
+  if (!unlocked) {
+    return (
+      <AccessGateScreen
+        onUnlock={() => {
+          try {
+            window.localStorage.setItem(ACCESS_UNLOCKED_KEY, "true");
+          } catch {
+            // localStorage unavailable (e.g. private browsing) - still unlock
+            // for this page load, just won't be remembered next visit.
+          }
+          setUnlocked(true);
+        }}
+      />
+    );
+  }
+
+  return <PitchBookerApp />;
+}
+
+function AccessGateScreen({ onUnlock }) {
+  const [pin, setPin] = useState("");
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState(false);
+
+  async function submit(e) {
+    e.preventDefault();
+    if (!pin.trim()) return;
+    setChecking(true);
+    setError(false);
+    try {
+      const { data, error: err } = await supabase.rpc("verify_access_pin", { input_pin: pin.trim() });
+      if (err) throw err;
+      if (data) {
+        onUnlock();
+      } else {
+        setError(true);
+      }
+    } catch (e) {
+      console.error(e);
+      setError(true);
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  return (
+    <div style={{ minHeight: "100vh" }} className="pb-root">
+      <style>{css}</style>
+      <div className="pb-result-wrap">
+        <div className="pb-result-card">
+          <div className="pb-result-head" style={{ background: "#0D0D0D" }}>
+            <img src="/crest.png" alt="" className="pb-crest-img" />
+            <strong>Drogheda Town FC</strong>
+          </div>
+          <div className="pb-result-body">
+            <h1 style={{ color: "#C8102E" }}>Pitch Book</h1>
+            <p>Enter the club PIN to view and book pitches.</p>
+            <form onSubmit={submit} className="pb-form">
+              <label>
+                PIN
+                <input
+                  type="password"
+                  inputMode="numeric"
+                  autoFocus
+                  value={pin}
+                  onChange={(e) => setPin(e.target.value)}
+                  style={{ fontSize: 20, letterSpacing: 4, textAlign: "center" }}
+                />
+              </label>
+              {error && <div className="pb-inline-warning">That PIN isn't right.</div>}
+              <button type="submit" className="pb-btn-primary pb-submit" disabled={checking}>
+                {checking ? "Checking…" : "Unlock"}
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PitchBookerApp() {
   const [pitches, setPitches] = useState(null);
   const [teams, setTeams] = useState(null);
   const [coaches, setCoaches] = useState(null);
